@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 
 use krio_stackless::cfg::{CoroCfg, CoroHooks, Marker};
-use krio_stackless::executor::CooperativeExecutor;
+use krio_stackless::executor::{CooperativeExecutor, WakerExecutor};
 
 // ── Toy IR ────────────────────────────────────────────────────────
 
@@ -432,4 +432,94 @@ fn toy_adapter_no_region_passthrough() {
     let mut exec = CooperativeExecutor;
     krio_stackless::run_with(&mut body, &mut hooks, &mut exec);
     assert_eq!(body.blocks.len(), before);
+}
+
+// ── WakerExecutor tests ───────────────────────────────────────────
+
+#[test]
+fn waker_executor_records_one_region_pair() {
+    // After the transform runs with WakerExecutor, the executor
+    // should have one (done, pending) BlockId pair recorded —
+    // that's how the host wires its waker plumbing.
+    let mut body = build_simple_region();
+    let mut hooks = ToyHooks;
+    let mut exec = WakerExecutor::<ToyBlockId>::new();
+    krio_stackless::run_with(&mut body, &mut hooks, &mut exec);
+
+    assert_eq!(
+        exec.regions.len(),
+        1,
+        "expected one RegionExits recorded, got {}",
+        exec.regions.len()
+    );
+    let exits = &exec.regions[0];
+    assert_ne!(
+        exits.done, exits.pending,
+        "done and pending must be distinct blocks"
+    );
+}
+
+#[test]
+fn waker_executor_erases_markers_too() {
+    // WakerExecutor still erases all markers, same as Cooperative.
+    let mut body = build_simple_region();
+    let mut hooks = ToyHooks;
+    let mut exec = WakerExecutor::<ToyBlockId>::new();
+    krio_stackless::run_with(&mut body, &mut hooks, &mut exec);
+
+    let markers = count_markers(&body);
+    assert!(
+        markers.is_empty(),
+        "expected all markers erased, found {markers:?}"
+    );
+}
+
+#[test]
+fn waker_executor_no_loop_back() {
+    // The cooperative executor's loop body branches from the final
+    // all_done check back to its `loop_top`. WakerExecutor branches
+    // to `region_pending` instead — and `region_pending`'s default
+    // terminator is whatever the toy adapter installed for a fresh
+    // block (Unreachable). Verify region_pending is reachable AND
+    // unreachable-terminated (consumer's job to wire it up).
+    let mut body = build_simple_region();
+    let mut hooks = ToyHooks;
+    let mut exec = WakerExecutor::<ToyBlockId>::new();
+    krio_stackless::run_with(&mut body, &mut hooks, &mut exec);
+
+    let pending_bb = exec.regions[0].pending;
+    let pending_term = &body.blocks[pending_bb.0 as usize].1;
+    assert!(
+        matches!(pending_term, ToyTerm::Unreachable),
+        "region_pending should default to Unreachable until host wires it up; got {pending_term:?}"
+    );
+}
+
+#[test]
+fn waker_executor_done_path_reaches_post_region() {
+    // The `done` exit should chain into the original post-region
+    // path (the toy fixture has "post-region" as the after-region
+    // user code). Following gotos from done should eventually land
+    // on a block whose first statement is User("post-region").
+    let mut body = build_simple_region();
+    let mut hooks = ToyHooks;
+    let mut exec = WakerExecutor::<ToyBlockId>::new();
+    krio_stackless::run_with(&mut body, &mut hooks, &mut exec);
+
+    let mut current = exec.regions[0].done;
+    let mut hops = 0;
+    let landed = loop {
+        hops += 1;
+        assert!(hops < 10, "too many hops chasing done's goto");
+        let (stmts, term) = &body.blocks[current.0 as usize];
+        let has_post = stmts.iter().any(|s| matches!(s, ToyStmt::User(name) if *name == "post-region"));
+        if has_post {
+            break true;
+        }
+        match term {
+            ToyTerm::Goto(next) => current = *next,
+            _ => break false,
+        }
+    };
+    assert!(landed, "done exit should chain to the post-region path");
 }

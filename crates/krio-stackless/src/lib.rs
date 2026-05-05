@@ -118,7 +118,7 @@ pub mod cfg;
 pub mod executor;
 
 pub use cfg::{CfgId, CoroCfg, CoroHooks, Marker};
-pub use executor::{CooperativeExecutor, Executor};
+pub use executor::{CooperativeExecutor, Executor, RegionExits, WakerExecutor};
 
 const DONE_STATE: i64 = 9999;
 

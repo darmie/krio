@@ -1,0 +1,16 @@
+[package]
+name = "krio-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Scheduler primitives for the krio family. Drives heterogeneous Tasks (fibers, async coroutines, host-wrapped stackless) through a uniform interface."
+
+[dependencies]
+krio-core = { workspace = true }
+
+[dev-dependencies]
+krio-fiber = { workspace = true }
+
+[lints]
+workspace = true

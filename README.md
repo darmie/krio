@@ -12,10 +12,15 @@ addresses a coherent execution model, and speaks the same vocabulary
 
 ```
 krio
-├── krio-core         — shared vocabulary (deps: none)
+├── krio-core         — shared vocabulary: Marker, Suspension,
+│                       CfgId, Task trait (deps: none)
+├── krio-runtime      — Scheduler trait + RoundRobin scheduler;
+│                       drives any Task to completion
 ├── krio-stackless    — per-function state-machine transform
+│                       (CooperativeExecutor + WakerExecutor)
 ├── krio-async        — cross-function stackless (planned)
-├── krio-fiber        — Wren/Lua-style stackful runtime (planned)
+├── krio-fiber        — Wren/Lua-style stackful runtime
+│                       (Fiber implements krio-core::Task)
 └── krio-preempt      — preemptive scheduler (planned)
 ```
 
@@ -38,9 +43,10 @@ tasks (per-fiber stack, but suspension Just Works).
 | Crate            | Status              |
 |---|---|
 | `krio-core`      | ✅ shipped          |
-| `krio-stackless` | ✅ shipped          |
+| `krio-runtime`   | ✅ shipped — RoundRobin scheduler |
+| `krio-stackless` | ✅ shipped — CooperativeExecutor + WakerExecutor |
+| `krio-fiber`     | ✅ shipped — Fiber on x86_64 + aarch64 |
 | `krio-async`     | 🚧 planned (stub)  |
-| `krio-fiber`     | 🚧 planned (stub)  |
 | `krio-preempt`   | 🚧 planned (stub)  |
 
 ## Tradeoffs at a glance

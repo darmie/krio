@@ -26,7 +26,7 @@ LLVM / Cranelift / your interpreter / wherever.
 | **1** | Standalone crate, in-tree, concrete IR types | ✅ shipped |
 | **2** | `CoroCfg` + `CoroHooks` traits — plug in your IR; `Executor` trait — swap scheduling models | ✅ shipped |
 | **2.1** | Crate is dependency-free; adapters live with their host compiler | ✅ shipped |
-| **2.5** | `WakerExecutor` for waker-driven async (sibling to `CooperativeExecutor`) | planned |
+| **2.5** | `WakerExecutor` for waker-driven async (sibling to `CooperativeExecutor`) | ✅ shipped |
 | **3** | Standalone repo + crates.io | planned |
 
 The crate has no runtime dependencies — the transform operates
@@ -298,23 +298,30 @@ pub trait Executor<C: CoroCfg> {
 }
 ```
 
-Today: `CooperativeExecutor` (round-robin polling loop). The Phase 2.5
-plan adds `WakerExecutor` — same state-machine transform, different
-finalization strategy (per-coroutine poll fns + waker registration
-instead of a loop).
+Two built-ins:
+
+- `CooperativeExecutor` — round-robin polling loop. Drives every
+  coroutine to completion in one stack frame. Best when the host can
+  afford to "park" inside the polling loop.
+- `WakerExecutor` — one-shot poll structure with two exits
+  (`region_done` / `region_pending`). The host wraps the enclosing
+  function in its own waker plumbing and re-enters on wake events.
+  Records the exit BlockIds in `WakerExecutor::regions` so the host
+  can wire `region_pending` to whatever "yield Pending to the caller"
+  idiom its IR uses.
+
+  **Caveat — state persistence.** The state and poll-result locals
+  are emitted as plain CFG locals. For the post-Pending re-entry to
+  observe saved state, the host compiler must lift those locals
+  across calls (typically via `krio-async`'s captures-to-fields pass,
+  or via heap-allocating state and threading it through manually).
+  Without that, a second poll re-initialises state. This is the line
+  between the stackless transform and the full async story —
+  `WakerExecutor` deliberately stops short.
 
 ---
 
 ## Roadmap
-
-### Phase 2.5 — `WakerExecutor`
-
-The state-machine transform stays neutral about how the dispatch
-blocks get called. The cooperative path wraps them in a round-robin
-loop; the waker path emits a per-coroutine poll function whose
-suspend sites register a `Waker` and return `Pending`. Same
-machinery, different finalization. Tracked behind the `Executor`
-trait.
 
 ### Sibling — preemptive scheduling
 

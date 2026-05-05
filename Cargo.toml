@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/krio-core",
+    "crates/krio-runtime",
     "crates/krio-stackless",
     "crates/krio-async",
     "crates/krio-fiber",
@@ -17,6 +18,7 @@ description = "Coroutine framework family — stackless transforms, stackful fib
 
 [workspace.dependencies]
 krio-core      = { path = "crates/krio-core",      version = "0.1.0" }
+krio-runtime   = { path = "crates/krio-runtime",   version = "0.1.0" }
 krio-stackless = { path = "crates/krio-stackless", version = "0.1.0" }
 krio-async     = { path = "crates/krio-async",     version = "0.1.0" }
 krio-fiber     = { path = "crates/krio-fiber",     version = "0.1.0" }

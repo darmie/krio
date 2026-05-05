@@ -18,13 +18,17 @@
 //!   plug into the trait surfaces.
 //! - [`Suspension`] — a normalised report of "why did the coroutine
 //!   stop running" that schedulers can act on uniformly.
+//! - [`Task`] — "advance one step" interface that runtime variants
+//!   (`krio-fiber`, future `krio-async`, host wrappers around
+//!   `krio-stackless`) implement so a single scheduler can drive a
+//!   heterogeneous mix.
 //!
 //! ## What does *not* live here
 //!
 //! - The state-machine transform → `krio-stackless`.
 //! - The fiber runtime → `krio-fiber`.
 //! - The cross-function async transform → `krio-async`.
-//! - Schedulers / executors → each variant ships its own.
+//! - Scheduler implementations → `krio-runtime`.
 
 #![no_std]
 
@@ -68,6 +72,35 @@ pub enum Suspension {
     Yielded,
     /// Coroutine suspended waiting on a channel / future / event.
     Pending,
+}
+
+impl Suspension {
+    /// Has the underlying coroutine finished — i.e. is it safe to
+    /// drop without leaking work?
+    pub fn is_done(self) -> bool {
+        matches!(self, Suspension::Completed)
+    }
+}
+
+/// A unit of work a krio scheduler can drive. Implemented by every
+/// runtime in the family that produces something callable:
+/// `krio-fiber::Fiber`, `krio-async`'s future-equivalent (when that
+/// lands), and any host wrapper around `krio-stackless` output that
+/// the host compiler synthesises.
+///
+/// `krio-stackless` itself does *not* implement `Task` — it's a
+/// compile-time transform. The host wraps its output into a `Task`
+/// via whatever IR-to-runtime bridge it has.
+pub trait Task {
+    /// Run one step. Returns:
+    /// - [`Suspension::Yielded`] / [`Suspension::Pending`] if the
+    ///   task is still alive.
+    /// - [`Suspension::Completed`] when the task is finished.
+    ///
+    /// After `Completed` is returned, calling `step` again is a
+    /// programming error (panic / abort / undefined behaviour at
+    /// the implementer's discretion).
+    fn step(&mut self) -> Suspension;
 }
 
 /// IDs the consumer uses to refer to blocks and locals in CFG-shaped

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Stackful Wren/Lua-style fibers (planned). Per-fiber stack allocation, target-specific context-switch primitive, first-class Fiber values, bidirectional call/yield."
+description = "Stackful Wren/Lua-style fibers. Per-fiber stack allocation, target-specific context-switch primitive, first-class Fiber values."
 
 [dependencies]
 krio-core = { workspace = true }

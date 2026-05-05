@@ -1,31 +1,49 @@
-//! krio-fiber — stackful Wren/Lua-style fibers (planned).
+//! krio-fiber — Wren/Lua-style stackful fibers.
 //!
 //! First-class coroutine values backed by a per-fiber stack and a
 //! target-specific context-switch primitive. Yield works from any
-//! call depth because the suspension preserves the entire stack —
-//! no compile-time transform is involved.
+//! call depth because the suspension preserves the entire physical
+//! stack — no compile-time transform involved.
 //!
-//! ## Status: NOT YET IMPLEMENTED
+//! ## Usage
 //!
-//! Targeted surface (Wren-shaped):
+//! ```no_run
+//! use krio_fiber::{Fiber, FiberStep, yield_now};
 //!
-//! - `Fiber::new(closure) -> Fiber` — allocate a stack, install the
-//!   closure as the entry point.
-//! - `fiber.call(value) -> CallOutcome` — switch into the fiber,
-//!   returning whatever it next yields or its final return value.
-//! - `Fiber::yield_(value) -> ResumeValue` — from inside the fiber,
-//!   suspend and hand `value` back to the caller's `.call(...)`.
-//! - `fiber.is_done() -> bool`.
+//! let mut fiber = Fiber::new(|| {
+//!     println!("step 1");
+//!     yield_now();
+//!     println!("step 2");
+//!     yield_now();
+//!     println!("step 3");
+//! });
 //!
-//! Targeted internals:
+//! while let FiberStep::Yielded = fiber.resume() {
+//!     // Each loop body runs between two yields.
+//! }
+//! ```
 //!
-//! - Fixed-size stack pages (configurable, ~4-32 KB default).
-//! - Context switch in target-specific asm: x86_64, aarch64, riscv64
-//!   to start. Saves callee-saved registers + swaps the stack
-//!   pointer; ~30-50 lines per target.
-//! - `Fiber` is `!Send` by construction (single-thread cooperative).
-//!   A separate variant could lift this for work-stealing later.
+//! ## Status
 //!
-//! Until landed, this crate is empty.
+//! - x86_64 + aarch64 context-switch implemented (System V / AAPCS64).
+//! - Single-threaded; `Fiber` is `!Send`.
+//! - Stack allocated as a heap `Box<[u8]>`. An `mmap`-backed variant
+//!   with a guard page is a reasonable follow-up; the API stays the
+//!   same.
+//! - Bidirectional value passing (`call(input) -> Output` per Wren)
+//!   not yet implemented — the current API is unit-typed yields. Add
+//!   an extra typed channel if you need it; the underlying switch is
+//!   already in place.
+//!
+//! ## Where this fits in the krio family
+//!
+//! `krio-fiber` is a runtime, not a transform — it shares the
+//! `Marker` / `Suspension` vocabulary in `krio-core` but does not
+//! depend on `krio-stackless`'s state-machine algorithm. A program
+//! can mix stackless coroutines and stackful fibers freely; they
+//! cost what their model says they cost.
 
-#![no_std]
+mod arch;
+mod fiber;
+
+pub use fiber::{DEFAULT_STACK_SIZE, Fiber, FiberStep, yield_now};
