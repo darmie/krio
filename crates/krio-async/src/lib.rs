@@ -220,6 +220,60 @@ pub struct StateMachineLayout<B: CfgId, V: CfgId, F: FnId> {
     pub block_kinds: Vec<(B, BlockKind<B, V, F>)>,
 }
 
+/// Live-across-suspension data the host hands to the transform.
+///
+/// For each suspension site `(block, statement_idx)`, the host
+/// records the values that are defined before the suspension and
+/// used after it. The transform turns these into save/load slot
+/// tables in the returned [`StateMachineLayout`].
+///
+/// The host computes liveness with whatever dataflow framework its
+/// IR uses; krio-async deliberately doesn't model it because:
+///
+/// - liveness depends on how the host's IR represents def/use
+///   chains (SSA vs explicit locals, single-assignment vs reassign,
+///   ownership flowing through Drop checks, etc.);
+/// - serious compilers already have liveness; re-implementing
+///   inside the library would either duplicate or be too coarse;
+/// - the host knows value types, which a library can't.
+///
+/// An empty `at_site` is fine — krio-async treats it as "no
+/// captures." If the host's liveness is wrong (under-reports),
+/// downstream code reads stale state; that's a host-side bug, not
+/// a library check.
+pub struct LivenessMap<B: CfgId, V: CfgId> {
+    pub at_site: Vec<((B, usize), Vec<V>)>,
+}
+
+impl<B: CfgId, V: CfgId> LivenessMap<B, V> {
+    pub fn new() -> Self {
+        Self {
+            at_site: Vec::new(),
+        }
+    }
+
+    /// Record that `values` are live across the suspension at
+    /// `(block, idx)`. Used by hosts building a `LivenessMap`
+    /// procedurally.
+    pub fn record(&mut self, block: B, idx: usize, values: Vec<V>) {
+        self.at_site.push(((block, idx), values));
+    }
+
+    fn lookup(&self, block: B, idx: usize) -> &[V] {
+        self.at_site
+            .iter()
+            .find(|((b, i), _)| *b == block && *i == idx)
+            .map(|(_, v)| v.as_slice())
+            .unwrap_or(&[])
+    }
+}
+
+impl<B: CfgId, V: CfgId> Default for LivenessMap<B, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Runtime-side per-frame state. Equivalent to wren_lift's
 /// `AotFrameState`. The host stores one of these per active call on
 /// the fiber's frame stack.
@@ -251,71 +305,69 @@ impl<V> Default for FrameState<V> {
     }
 }
 
-/// Errors the transform can refuse with. Matches wren_lift's "v1
-/// caps" — features the simple split can't yet handle. Surface
-/// these as hard errors so a host can't silently mis-compile.
+/// Errors the transform can refuse with. Surface these as hard
+/// errors so a host can't silently mis-compile.
 #[derive(Debug)]
-pub enum TransformError<B: CfgId, V: CfgId> {
-    /// A value defined before a suspension is used after it.
-    /// Implementing this requires lowering "save value to frame
-    /// slot" + "load on resume"; planned for Phase 2.
-    LiveValueAcrossSuspension { block: B, value: V },
-    /// A suspension call landed inside a block that already has a
-    /// non-Return terminator (e.g. inside a Branch). v1 only
-    /// supports linear bodies; v2 will handle this.
+pub enum TransformError<B: CfgId> {
+    /// A suspension call landed inside a block that has statements
+    /// after it. Phase 2 v1/v2 only handle yield-at-tail; v3 will
+    /// split mid-block by replicating the post-yield tail across
+    /// successors. Hosts can also work around this by normalising
+    /// their CFG before calling krio-async.
     SuspensionInBranchedBlock { block: B },
-    /// Phase 1: the transform body isn't implemented yet. Hosts
-    /// integrating against the API will see this until Phase 2
-    /// lands the lowering.
+    /// A `SuspensionSite::CrossFnCall` was classified — Phase 3
+    /// hasn't landed.
     Unimplemented,
 }
 
 /// Transform a function's CFG into a state-machine layout.
 ///
-/// **Phase 2 v1** — direct yields only:
+/// **Phase 2 v2** — direct yields with captures lift:
 ///
+/// - Splits each yield's block at the yield, building the
+///   `resume_entries` table.
+/// - Reads `liveness` to find values that cross each suspension,
+///   allocates a slot per unique value across the function, and
+///   populates `yield_saves` (what to save before each yield's
+///   Return) + `resume_loads` (what to load at each resume entry).
 /// - Refuses cross-function calls to suspending callees with
 ///   [`TransformError::Unimplemented`] (Phase 3 covers them).
-/// - Refuses values that live across a suspension with
-///   [`TransformError::LiveValueAcrossSuspension`] — Phase 2 v2
-///   adds the captures-to-fields lift. v1 expects every value
-///   used after a yield to be (re)defined after the yield too.
 /// - Refuses suspensions that aren't the last statement of their
-///   block with [`TransformError::SuspensionInBranchedBlock`] —
-///   v1 only handles the linear case where the block ends with
-///   the yield. v2 will split mid-block.
+///   block with [`TransformError::SuspensionInBranchedBlock`].
 ///
-/// The transform mutates `cfg` by splitting each yield's block
-/// after the yield's index — the new (initially empty) block
-/// becomes the resume entry for that state. The original block
-/// keeps the yield as its tail, ready for the host's lowering to
-/// rewrite the terminator as "save state, kind=Yield, return".
+/// On success, the host's lowering reads the layout to:
+/// 1. Emit a dispatcher prologue (load state_id, switch to
+///    `resume_entries[state_id]`).
+/// 2. For each yield block, emit `runtime_save(frame, slot, v)`
+///    for every `(slot, v)` in `yield_saves[block]` before the
+///    Return; advance state; stamp kind=Yield.
+/// 3. For each resume block in `resume_loads`, emit
+///    `let v_fresh = runtime_load(frame, slot)` and rewrite
+///    downstream uses of the original `v` to `v_fresh` using the
+///    host's IR's normal use-rewriting machinery.
 ///
-/// On success, the returned [`StateMachineLayout`] tells the host:
-/// - `resume_entries[0]` = the original entry block (state 0)
-/// - `resume_entries[i]` = the block to enter at state `i`
-/// - `yield_blocks[i]` = `(block, next_state)` — block whose
-///   Return should advance to `next_state` and stamp kind=Yield
-/// - `block_kinds[i]` = `(block, BlockKind)` — the lowering shape
-///
-/// The host emits the dispatcher prologue itself (it knows how to
-/// load `state_id` from its runtime — typically a fiber-frame helper
-/// call krio-async deliberately doesn't model).
+/// Slot allocation is **one slot per unique LocalId** across all
+/// suspensions in this function. A value live at multiple yields
+/// uses the same slot (saved at each yield, loaded at each resume).
+/// Hosts wanting tighter packing (e.g. share slots between
+/// non-overlapping live ranges) can pass a smaller `liveness` and
+/// trust krio-async's allocator.
 pub fn transform_to_state_machine<S, H>(
     cfg: &mut H::Cfg,
     fn_id: H::FnId,
     suspending: &S,
     hooks: &H,
+    liveness: &LivenessMap<
+        <H::Cfg as krio_stackless::CoroCfg>::BlockId,
+        <H::Cfg as krio_stackless::CoroCfg>::LocalId,
+    >,
 ) -> Result<
     StateMachineLayout<
         <H::Cfg as krio_stackless::CoroCfg>::BlockId,
         <H::Cfg as krio_stackless::CoroCfg>::LocalId,
         H::FnId,
     >,
-    TransformError<
-        <H::Cfg as krio_stackless::CoroCfg>::BlockId,
-        <H::Cfg as krio_stackless::CoroCfg>::LocalId,
-    >,
+    TransformError<<H::Cfg as krio_stackless::CoroCfg>::BlockId>,
 >
 where
     S: SuspendingFns<FnId = H::FnId>,
@@ -331,28 +383,21 @@ where
         });
     }
 
-    // Snapshot block IDs before splitting — `cfg.block_ids()` would
-    // grow as we split, but we only want to scan the original
-    // function body, not the new resume blocks.
+    // Snapshot block IDs before splitting.
     let original_blocks: Vec<_> = cfg.block_ids();
     let entry_block = *original_blocks
         .first()
         .expect("krio-async: cfg has no blocks");
 
     // Pass 1 — scan + classify + validate.
-    // Vec of (block, idx_at_scan_time, site, count_at_scan_time).
     let mut sites = Vec::new();
     for &bb in &original_blocks {
         let count = cfg.statement_count(bb);
         for idx in 0..count {
             if let Some(site) = hooks.classify(cfg, bb, idx) {
-                // v1 cap: must be the last statement in the block.
-                // Lifts in v2 (split mid-block, replicate post-yield
-                // tail across control-flow successors).
                 if idx + 1 != count {
                     return Err(TransformError::SuspensionInBranchedBlock { block: bb });
                 }
-                // v1 cap: cross-fn calls are Phase 3.
                 if matches!(site, SuspensionSite::CrossFnCall { .. }) {
                     return Err(TransformError::Unimplemented);
                 }
@@ -361,30 +406,59 @@ where
         }
     }
 
-    // Pass 2 — split each yield's block. Since v1 caps require one
-    // suspension per block at the tail, every split is independent
-    // — order doesn't matter and indices stay valid.
+    // Pass 2 — split each yield's block.
     let mut resume_entries = vec![entry_block];
     let mut yield_blocks = Vec::new();
     let mut block_kinds = Vec::new();
 
-    for (bb, idx, _site) in sites {
-        // split_after at the last index produces an empty new block
-        // that inherits bb's terminator. The new block is the resume
-        // entry; bb keeps the yield as its tail.
-        let resume = cfg.split_after(bb, idx);
+    for (bb, idx, _site) in &sites {
+        let resume = cfg.split_after(*bb, *idx);
         let next_state = resume_entries.len() as u32;
         resume_entries.push(resume);
-        yield_blocks.push((bb, next_state));
-        block_kinds.push((bb, BlockKind::DirectYield));
+        yield_blocks.push((*bb, next_state));
+        block_kinds.push((*bb, BlockKind::DirectYield));
+    }
+
+    // Pass 3 — captures lift. Walk the suspension sites again,
+    // consult `liveness`, allocate slots, and record save/load
+    // pairs. Slot allocation is global per function: a value live
+    // at multiple suspensions reuses its slot.
+    use alloc::collections::BTreeMap;
+    let mut value_to_slot: BTreeMap<
+        <H::Cfg as krio_stackless::CoroCfg>::LocalId,
+        u32,
+    > = BTreeMap::new();
+    let mut next_slot: u32 = 0;
+    let mut yield_saves = Vec::new();
+    let mut resume_loads = Vec::new();
+
+    for (i, (bb, idx, _site)) in sites.iter().enumerate() {
+        let live = liveness.lookup(*bb, *idx);
+        if live.is_empty() {
+            continue;
+        }
+        let mut entries: Vec<(u32, _)> = Vec::with_capacity(live.len());
+        for &v in live {
+            let slot = *value_to_slot.entry(v).or_insert_with(|| {
+                let s = next_slot;
+                next_slot += 1;
+                s
+            });
+            entries.push((slot, v));
+        }
+        // Same slot table on both sides: host saves (slot, v) before
+        // Return and loads (slot) at the resume block, rebinding
+        // uses of v to a fresh local with its own machinery.
+        yield_saves.push((*bb, entries.clone()));
+        let resume_bb = resume_entries[i + 1];
+        resume_loads.push((resume_bb, entries));
     }
 
     Ok(StateMachineLayout {
         resume_entries,
         yield_blocks,
-        // v2 will populate these.
-        yield_saves: Vec::new(),
-        resume_loads: Vec::new(),
+        yield_saves,
+        resume_loads,
         block_kinds,
     })
 }

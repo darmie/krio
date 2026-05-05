@@ -2,7 +2,7 @@
 //! transform against a minimal toy CFG.
 
 use krio_async::{
-    AsyncHooks, BlockKind, FrameState, SuspendingFns, SuspensionSite, TransformError,
+    AsyncHooks, BlockKind, FrameState, LivenessMap, SuspendingFns, SuspensionSite, TransformError,
     transform_to_state_machine,
 };
 use krio_stackless::CoroCfg;
@@ -162,7 +162,7 @@ fn non_suspending_fn_returns_trivial_layout() {
     };
     let hooks = ToyHooks;
 
-    let layout = transform_to_state_machine(&mut cfg, ToyFnId(42), &suspending, &hooks)
+    let layout = transform_to_state_machine(&mut cfg, ToyFnId(42), &suspending, &hooks, &LivenessMap::new())
         .expect("non-suspending fn should produce a trivial Ok layout");
     assert!(layout.resume_entries.is_empty());
     assert!(layout.yield_blocks.is_empty());
@@ -183,7 +183,7 @@ fn no_yields_in_suspending_fn_just_records_entry() {
         yields: HashSet::new(),
     };
     let layout =
-        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks).unwrap();
+        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks, &LivenessMap::new()).unwrap();
     assert_eq!(layout.resume_entries.len(), 1, "state 0 = entry");
     assert!(layout.yield_blocks.is_empty());
     assert!(layout.block_kinds.is_empty());
@@ -200,7 +200,7 @@ fn single_yield_at_block_tail_splits_correctly() {
         yields: HashSet::new(),
     };
     let layout =
-        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks).unwrap();
+        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks, &LivenessMap::new()).unwrap();
 
     // resume_entries[0] = original entry, resume_entries[1] = block
     // created by splitting after the yield (initially empty).
@@ -235,7 +235,7 @@ fn yield_in_middle_of_block_is_v1_capped() {
         suspending: HashSet::from([ToyFnId(1)]),
         yields: HashSet::new(),
     };
-    let result = transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks);
+    let result = transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks, &LivenessMap::new());
     assert!(matches!(
         result,
         Err(TransformError::SuspensionInBranchedBlock { .. })
@@ -272,7 +272,7 @@ fn cross_fn_call_is_v1_capped() {
         suspending: HashSet::from([ToyFnId(1)]),
         yields: HashSet::new(),
     };
-    let result = transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &CrossFnHooks);
+    let result = transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &CrossFnHooks, &LivenessMap::new());
     assert!(matches!(result, Err(TransformError::Unimplemented)));
 }
 
@@ -289,7 +289,7 @@ fn multiple_yields_each_get_own_state() {
         yields: HashSet::new(),
     };
     let layout =
-        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks).unwrap();
+        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks, &LivenessMap::new()).unwrap();
 
     assert_eq!(layout.resume_entries.len(), 3);
     assert_eq!(layout.yield_blocks.len(), 2);
@@ -302,4 +302,139 @@ fn frame_state_default_is_state_zero() {
     let frame: FrameState<u64> = FrameState::default();
     assert_eq!(frame.state_id, 0);
     assert!(frame.saved_values.is_empty());
+}
+
+// ── Phase 2 v2: captures lift ─────────────────────────────────────
+
+#[test]
+fn liveness_drives_save_load_tables() {
+    // One yield with two values live across it. The transform
+    // should allocate slots [0, 1] and record both sides.
+    let mut cfg = ToyCfg::new();
+    cfg.push_block(vec![ToyStmt::User("compute"), ToyStmt::Yield]);
+
+    let suspending = ToySuspending {
+        suspending: HashSet::from([ToyFnId(1)]),
+        yields: HashSet::new(),
+    };
+
+    let mut liveness = LivenessMap::new();
+    liveness.record(
+        ToyBlockId(0),
+        1, // index of the Yield stmt
+        vec![ToyValueId(7), ToyValueId(11)],
+    );
+
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &ToyHooks,
+        &liveness,
+    )
+    .unwrap();
+
+    assert_eq!(layout.yield_saves.len(), 1);
+    let (save_block, saves) = &layout.yield_saves[0];
+    assert_eq!(*save_block, ToyBlockId(0));
+    assert_eq!(saves.len(), 2);
+    assert_eq!(saves[0], (0, ToyValueId(7)));
+    assert_eq!(saves[1], (1, ToyValueId(11)));
+
+    // resume_loads carries the same (slot, original_value) pairs,
+    // keyed on the resume entry block.
+    assert_eq!(layout.resume_loads.len(), 1);
+    let (load_block, loads) = &layout.resume_loads[0];
+    assert_eq!(*load_block, layout.resume_entries[1]);
+    assert_eq!(loads.len(), 2);
+    assert_eq!(loads[0], (0, ToyValueId(7)));
+    assert_eq!(loads[1], (1, ToyValueId(11)));
+}
+
+#[test]
+fn empty_liveness_skips_save_load_tables() {
+    // No live values → no entries in yield_saves / resume_loads.
+    // Splits + state numbering still happen.
+    let mut cfg = ToyCfg::new();
+    cfg.push_block(vec![ToyStmt::User("a"), ToyStmt::Yield]);
+
+    let suspending = ToySuspending {
+        suspending: HashSet::from([ToyFnId(1)]),
+        yields: HashSet::new(),
+    };
+
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &ToyHooks,
+        &LivenessMap::new(),
+    )
+    .unwrap();
+
+    assert_eq!(layout.resume_entries.len(), 2);
+    assert!(layout.yield_saves.is_empty());
+    assert!(layout.resume_loads.is_empty());
+}
+
+#[test]
+fn shared_value_across_yields_reuses_slot() {
+    // Same value live at two suspensions should hit the same slot.
+    // Demonstrates that the slot allocator is per-function, not
+    // per-suspension.
+    let mut cfg = ToyCfg::new();
+    cfg.push_block(vec![ToyStmt::User("def_v"), ToyStmt::Yield]);
+    cfg.push_block(vec![ToyStmt::User("use_v"), ToyStmt::Yield]);
+
+    let suspending = ToySuspending {
+        suspending: HashSet::from([ToyFnId(1)]),
+        yields: HashSet::new(),
+    };
+
+    let mut liveness = LivenessMap::new();
+    liveness.record(ToyBlockId(0), 1, vec![ToyValueId(42)]);
+    liveness.record(ToyBlockId(1), 1, vec![ToyValueId(42)]);
+
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &ToyHooks,
+        &liveness,
+    )
+    .unwrap();
+
+    assert_eq!(layout.yield_saves.len(), 2);
+    // Both saves use slot 0 because the same value is live at both.
+    assert_eq!(layout.yield_saves[0].1[0], (0, ToyValueId(42)));
+    assert_eq!(layout.yield_saves[1].1[0], (0, ToyValueId(42)));
+}
+
+#[test]
+fn distinct_values_get_distinct_slots() {
+    // Different values at different suspensions get separate slots.
+    let mut cfg = ToyCfg::new();
+    cfg.push_block(vec![ToyStmt::User("def_a"), ToyStmt::Yield]);
+    cfg.push_block(vec![ToyStmt::User("def_b"), ToyStmt::Yield]);
+
+    let suspending = ToySuspending {
+        suspending: HashSet::from([ToyFnId(1)]),
+        yields: HashSet::new(),
+    };
+
+    let mut liveness = LivenessMap::new();
+    liveness.record(ToyBlockId(0), 1, vec![ToyValueId(1)]);
+    liveness.record(ToyBlockId(1), 1, vec![ToyValueId(2)]);
+
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &ToyHooks,
+        &liveness,
+    )
+    .unwrap();
+
+    assert_eq!(layout.yield_saves[0].1[0], (0, ToyValueId(1)));
+    assert_eq!(layout.yield_saves[1].1[0], (1, ToyValueId(2)));
 }

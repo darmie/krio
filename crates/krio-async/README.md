@@ -13,33 +13,57 @@ function. Locals that live across a suspension are lifted from
 stack slots into a per-frame slot table on a runtime fiber-style
 frame stack.
 
-## Status — Phase 2 v1
+## Status — Phase 2 v2
 
-The direct-yield lowering is in. Hosts wire their IR up by
-implementing `krio-stackless::CoroCfg` for their CFG and `AsyncHooks`
-for marker classification, then call `transform_to_state_machine`.
-For each yielding function the transform splits at every yield
-site, returns the layout (`resume_entries`, `yield_blocks`,
-`block_kinds`), and the host's codegen reads it to emit the
-dispatcher prologue and per-block lowering.
+Direct-yield split + captures-to-fields lift are in. Hosts wire
+their IR up by implementing `krio-stackless::CoroCfg` for their
+CFG and `AsyncHooks` for marker classification, then pass a
+precomputed `LivenessMap` to `transform_to_state_machine`. The
+transform splits at every yield site, allocates slots for live-
+across values, and returns a `StateMachineLayout` with
+`resume_entries`, `yield_blocks`, `yield_saves`, `resume_loads`,
+and `block_kinds`. The host's codegen reads it to emit the
+dispatcher prologue, the per-block lowering, the save/load helper
+calls, and the use rewrites.
 
 | Phase | What it gives you | Status |
 |---|---|---|
 | **1** | Public type contract + stub | ✅ shipped |
-| **2 v1** | Direct-yield split (one yield per block, at tail; no cross-fn) | ✅ shipped |
-| **2 v2** | Captures-to-fields lift + mid-block yield | planned |
-| **3** | Cross-function call dispatch | planned |
+| **2 v1** | Direct-yield split | ✅ shipped |
+| **2 v2** | Captures-to-fields lift via `LivenessMap` | ✅ shipped |
+| **3 (was v3)** | Mid-block yield (host-side normalisation preferred) | not planned in krio-async — fixable host-side |
+| **3 (cross-fn)** | Cross-function call dispatch | planned |
 
-### v1 caps (refused with `TransformError`)
+### What the host owns
+
+- **Liveness analysis** — host's dataflow framework, passed in via
+  `LivenessMap`. Krio-async never re-derives it.
+- **Type-aware save/load helpers** — host emits the actual
+  `runtime_save(frame, slot, v)` / `runtime_load(frame, slot)`
+  calls. Krio-async hands out the slot indices and the values
+  to save; the helper signature is the host's runtime ABI.
+- **Use rewriting** — host's IR's normal use-rewrite machinery
+  rebinds the loaded values. Krio-async tells the host
+  *which* values to rewrite and *where*.
+
+### What the host delegates
+
+- Block splitting at yield points.
+- State ID numbering.
+- Slot allocation (one slot per unique LocalId across the
+  function — pass smaller liveness sets if you want tighter
+  packing).
+- The contract: "if you save `(slot, v)` here, you load `slot`
+  there."
+
+### Caps still in place
 
 - **`SuspensionInBranchedBlock`** — yield is not the last statement
-  in its block. v2 will split mid-block by replicating the post-yield
-  tail across control-flow successors.
-- **`LiveValueAcrossSuspension`** — a value defined before a yield
-  is used after it. v2 adds the captures lift via `yield_saves` /
-  `resume_loads` (currently always empty in the layout).
-- **`Unimplemented`** — `SuspensionSite::CrossFnCall` classification.
-  Phase 3 handles cross-function dispatch.
+  in its block. The host should normalise its CFG (insert an
+  explicit branch) before calling krio-async; mid-block split is
+  out of scope for the library.
+- **`Unimplemented`** — `SuspensionSite::CrossFnCall`. Phase 3
+  handles cross-function dispatch.
 
 The design is a generalised port of the AOT state-machine lowering
 in the `wren_lift` Wren JIT/AOT runtime — that codebase already
