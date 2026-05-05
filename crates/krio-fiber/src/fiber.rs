@@ -3,6 +3,7 @@
 
 use std::any::Any;
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use krio_core::{Suspension, Task};
 
@@ -90,6 +91,11 @@ pub struct Fiber {
     /// Value handed out by the fiber's `yield_value(v)`. The host
     /// reads it via [`Fiber::take_yield_value`] after resume.
     output_slot: Cell<Option<Box<dyn Any + 'static>>>,
+    /// Process-unique id. Stable across resumes; useful for tagging
+    /// fibers in logs and scheduler queues.
+    id: u64,
+    /// Optional human-readable label. Free-form; no semantic meaning.
+    name: Option<String>,
     /// Heap-pinned trampoline state — kept alive while the fiber is
     /// running so the trampoline's pointer-to-closure stays valid.
     /// Boxed because the asm reads it through a stable address.
@@ -142,6 +148,14 @@ thread_local! {
 /// if you know your workload.
 pub const DEFAULT_STACK_SIZE: usize = 64 * 1024;
 
+/// Process-wide id counter. Atomic so multi-threaded callers (whose
+/// fibers run on separate threads) still get unique ids.
+static NEXT_FIBER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_fiber_id() -> u64 {
+    NEXT_FIBER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Fiber {
     /// Create a fiber that runs `f` to completion, with the default
     /// stack size. The fiber does not start running until
@@ -186,6 +200,8 @@ impl Fiber {
             deadline_ms: None,
             input_slot: Cell::new(None),
             output_slot: Cell::new(None),
+            id: next_fiber_id(),
+            name: None,
             _trampoline_state: state,
             _not_send: std::marker::PhantomData,
         }
@@ -274,6 +290,22 @@ impl Fiber {
     /// error or the payload has already been taken.
     pub fn take_error(&mut self) -> Option<Box<dyn Any + Send + 'static>> {
         self.error_payload.take()
+    }
+
+    /// Process-unique id assigned at construction. Stable across
+    /// resumes; useful as a key in scheduler queues / log lines.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Optional human-readable label set via [`Fiber::set_name`].
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Attach (or replace) a debugging label.
+    pub fn set_name<N: Into<String>>(&mut self, name: N) {
+        self.name = Some(name.into());
     }
 
     /// Continue running the fiber until it yields or terminates.
@@ -401,6 +433,16 @@ pub fn take_input<I: 'static>() -> Option<I> {
     );
     let received = unsafe { (*fiber_ptr).input_slot.take() };
     received.and_then(|b| b.downcast::<I>().ok().map(|b| *b))
+}
+
+/// Process-unique id of the currently running fiber, or `None` if
+/// invoked from the host thread.
+pub fn current_fiber_id() -> Option<u64> {
+    let fiber_ptr = ACTIVE_FIBER.with(|cell| cell.get());
+    if fiber_ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { (*fiber_ptr).id })
 }
 
 /// True if the currently running fiber has been cancelled. Returns

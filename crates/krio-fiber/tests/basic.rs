@@ -2,8 +2,8 @@
 //! cross the asm context-switch boundary.
 
 use krio_fiber::{
-    Fiber, FiberState, FiberStep, is_cancelled, should_yield_early, take_input, yield_now,
-    yield_value,
+    Fiber, FiberState, FiberStep, current_fiber_id, is_cancelled, should_yield_early, take_input,
+    yield_now, yield_value,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -385,4 +385,44 @@ fn cancellation_persists_across_resumes() {
     assert_eq!(fiber.resume(), FiberStep::Yielded);
     assert_eq!(fiber.resume(), FiberStep::Done);
     assert_eq!(*observations.borrow(), vec![false, true, true]);
+}
+
+// ── Identity + name ───────────────────────────────────────────────
+
+#[test]
+fn fiber_ids_are_unique() {
+    let a = Fiber::new(|| {});
+    let b = Fiber::new(|| {});
+    let c = Fiber::new(|| {});
+    assert_ne!(a.id(), b.id());
+    assert_ne!(b.id(), c.id());
+    assert_ne!(a.id(), c.id());
+}
+
+#[test]
+fn current_fiber_id_matches_inside() {
+    let observed = Rc::new(RefCell::new(0u64));
+    let observed_clone = observed.clone();
+
+    let mut fiber = Fiber::new(move || {
+        *observed_clone.borrow_mut() = current_fiber_id().unwrap();
+    });
+    let expected = fiber.id();
+    fiber.resume();
+    assert_eq!(*observed.borrow(), expected);
+}
+
+#[test]
+fn current_fiber_id_is_none_on_host() {
+    assert!(current_fiber_id().is_none());
+}
+
+#[test]
+fn fiber_name_round_trips() {
+    let mut fiber = Fiber::new(|| {});
+    assert_eq!(fiber.name(), None);
+    fiber.set_name("worker-1");
+    assert_eq!(fiber.name(), Some("worker-1"));
+    fiber.set_name(String::from("renamed"));
+    assert_eq!(fiber.name(), Some("renamed"));
 }
