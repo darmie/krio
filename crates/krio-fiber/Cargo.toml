@@ -9,5 +9,8 @@ description = "Stackful Wren/Lua-style fibers. Per-fiber stack allocation, targe
 [dependencies]
 krio-core = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

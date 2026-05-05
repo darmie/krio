@@ -1,19 +1,47 @@
 //! Fiber type + the global "currently active fiber" hook that
 //! [`yield_now`] uses to swap back to the caller.
 
+use std::any::Any;
 use std::cell::Cell;
 
 use krio_core::{Suspension, Task};
 
 use crate::arch::{SAVED_FRAME_BYTES, krio_fiber_switch};
+use crate::stack::Stack;
 
-/// Result of a single [`Fiber::resume`] call.
+/// Lifecycle state of a fiber.
+///
+/// Visible to the host between `resume` calls. The host doesn't see
+/// `Running` because `resume` is synchronous — when control returns
+/// to the host, the fiber has either yielded (Suspended) or
+/// terminated (Done / Errored).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FiberState {
+    /// Created but never resumed.
+    New,
+    /// Yielded back to the caller; can be resumed again.
+    Suspended,
+    /// Closure returned normally. Resuming again panics.
+    Done,
+    /// Closure panicked. The payload is on the fiber until taken via
+    /// [`Fiber::take_error`]. Resuming again panics.
+    Errored,
+}
+
+/// Result of a single [`Fiber::resume`] call. Mirrors [`FiberState`]
+/// minus `New` (you can't observe `New` from a `resume` return — by
+/// the time `resume` returns, the fiber has run at least to its
+/// first yield or end).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FiberStep {
     /// Fiber yielded; another `resume` will continue it.
     Yielded,
-    /// Fiber's entry closure returned; further `resume` calls panic.
+    /// Fiber's entry closure returned. Further `resume` calls panic.
     Done,
+    /// Fiber's entry closure panicked. The panic payload is parked
+    /// on the fiber; retrieve it with [`Fiber::take_error`]. Further
+    /// `resume` calls panic.
+    Errored,
 }
 
 /// A stackful coroutine. Owns its stack; runs an `FnOnce` closure
@@ -24,18 +52,44 @@ pub enum FiberStep {
 /// variant could lift this restriction once the scheduling story is
 /// concrete.
 pub struct Fiber {
-    /// Fiber's stack. Kept alive for the fiber's lifetime; freed on
-    /// drop. `_stack[0]` is the lowest address; the fiber grows the
-    /// stack downward from `_stack[len-1]`.
-    _stack: Box<[u8]>,
+    /// Fiber's stack. Owns its memory (mmap region with a guard page
+    /// on Unix, heap `Box<[u8]>` elsewhere). Freed on drop. The
+    /// fiber grows the stack downward from the top of the usable
+    /// region.
+    _stack: Stack,
     /// Current saved stack pointer for the fiber. On `resume`, we
     /// load from here; on `yield_now`, we save into here.
     fiber_sp: *mut u8,
     /// Saved stack pointer for the caller (where `resume` was
     /// invoked from). Populated on each `resume` call.
     caller_sp: *mut u8,
-    /// Set to `true` by the trampoline when the user closure returns.
+    /// Set to `true` by the trampoline when the user closure returns
+    /// or panics. Combined with `errored` it determines [`FiberState`].
     done: bool,
+    /// Set to `true` by the trampoline when the user closure panicked.
+    /// `done == true && errored == true` → [`FiberState::Errored`].
+    errored: bool,
+    /// Has [`Fiber::resume`] been called at least once?
+    started: bool,
+    /// Panic payload captured by the trampoline. Taken via
+    /// [`Fiber::take_error`].
+    error_payload: Option<Box<dyn Any + Send + 'static>>,
+    /// Cooperative cancellation flag. Set by [`Fiber::cancel`];
+    /// observed via [`Fiber::is_cancelled`] (and [`is_cancelled`]
+    /// from inside the fiber). Single-thread fibers don't need an
+    /// atomic — `Cell<bool>` is enough — but we use a `Cell` here
+    /// so external code can flip it through `&self`.
+    cancelled: Cell<bool>,
+    /// Optional absolute deadline in milliseconds since the Unix
+    /// epoch. Polled by [`Fiber::is_deadline_passed`] /
+    /// [`is_deadline_passed`].
+    deadline_ms: Option<f64>,
+    /// Value handed in by the host on `resume_with(v)`. The fiber
+    /// reads it from inside via [`yield_value`]'s return.
+    input_slot: Cell<Option<Box<dyn Any + 'static>>>,
+    /// Value handed out by the fiber's `yield_value(v)`. The host
+    /// reads it via [`Fiber::take_yield_value`] after resume.
+    output_slot: Cell<Option<Box<dyn Any + 'static>>>,
     /// Heap-pinned trampoline state — kept alive while the fiber is
     /// running so the trampoline's pointer-to-closure stays valid.
     /// Boxed because the asm reads it through a stable address.
@@ -51,8 +105,14 @@ pub struct Fiber {
 struct TrampolineState {
     closure: Option<Box<dyn FnOnce()>>,
     /// Pointer to the parent fiber's `done` flag. Set after the
-    /// closure returns.
+    /// closure returns or panics.
     done_flag: *mut bool,
+    /// Pointer to the parent fiber's `errored` flag. Set when the
+    /// closure panicked.
+    errored_flag: *mut bool,
+    /// Pointer to the parent fiber's `error_payload` slot. The
+    /// trampoline writes the captured panic payload here.
+    error_payload_slot: *mut Option<Box<dyn Any + Send + 'static>>,
     /// Pointer to the parent fiber's `caller_sp` slot. Used by
     /// `yield_now` to know which sp to switch back to.
     caller_sp_slot: *mut *mut u8,
@@ -66,6 +126,14 @@ thread_local! {
     /// null when running on the host stack. `yield_now` reads this
     /// to know how to switch back to the caller.
     static ACTIVE_TRAMPOLINE: Cell<*mut TrampolineState> =
+        const { Cell::new(std::ptr::null_mut()) };
+
+    /// `*mut Fiber` for the currently running fiber, or null when on
+    /// the host stack. Used by the fiber-side accessors
+    /// ([`is_cancelled`], [`is_deadline_passed`]) so user code can
+    /// poll cancellation without having to thread the `Fiber` handle
+    /// through every call.
+    static ACTIVE_FIBER: Cell<*mut Fiber> =
         const { Cell::new(std::ptr::null_mut()) };
 }
 
@@ -92,61 +160,153 @@ impl Fiber {
         F: FnOnce() + 'static,
     {
         let aligned = stack_size.max(SAVED_FRAME_BYTES + 64).next_multiple_of(16);
-        let mut stack = vec![0u8; aligned].into_boxed_slice();
+        let mut stack = Stack::new(aligned);
 
         let mut state = Box::new(TrampolineState {
             closure: Some(Box::new(f) as Box<dyn FnOnce()>),
             done_flag: std::ptr::null_mut(),
+            errored_flag: std::ptr::null_mut(),
+            error_payload_slot: std::ptr::null_mut(),
             caller_sp_slot: std::ptr::null_mut(),
             fiber_sp_slot: std::ptr::null_mut(),
         });
 
-        let fiber_sp = unsafe { prepare_initial_stack(&mut stack, &mut *state as *mut _) };
+        let fiber_sp =
+            unsafe { prepare_initial_stack(stack.usable_slice_mut(), &mut *state as *mut _) };
 
-        let mut fiber = Fiber {
+        Fiber {
             _stack: stack,
             fiber_sp,
             caller_sp: std::ptr::null_mut(),
             done: false,
+            errored: false,
+            started: false,
+            error_payload: None,
+            cancelled: Cell::new(false),
+            deadline_ms: None,
+            input_slot: Cell::new(None),
+            output_slot: Cell::new(None),
             _trampoline_state: state,
             _not_send: std::marker::PhantomData,
-        };
-
-        // Wire the trampoline back-pointers now that the fiber
-        // struct's address is stable on the heap... wait, the fiber
-        // itself is on the stack here. Move the wiring into resume(),
-        // before the first switch.
-        fiber._trampoline_state.done_flag = &mut fiber.done as *mut bool;
-        fiber._trampoline_state.caller_sp_slot = &mut fiber.caller_sp as *mut *mut u8;
-        fiber._trampoline_state.fiber_sp_slot = &mut fiber.fiber_sp as *mut *mut u8;
-
-        fiber
+        }
     }
 
-    /// Whether the fiber has completed (will panic on further
-    /// `resume` calls).
+    /// Set an absolute deadline (milliseconds since the Unix epoch).
+    /// User code inside the fiber can poll
+    /// [`Fiber::is_deadline_passed`] / [`is_deadline_passed`] and
+    /// yield/return early if the deadline has been crossed.
+    /// Replaces any previous deadline.
+    pub fn set_deadline_ms(&mut self, deadline_ms: f64) {
+        self.deadline_ms = Some(deadline_ms);
+    }
+
+    /// Clear the deadline.
+    pub fn clear_deadline(&mut self) {
+        self.deadline_ms = None;
+    }
+
+    /// Read the current deadline, if any.
+    pub fn deadline_ms(&self) -> Option<f64> {
+        self.deadline_ms
+    }
+
+    /// Mark this fiber as cancelled. The flag is only observed on
+    /// the next call to [`is_cancelled`] / [`Fiber::is_cancelled`]
+    /// — krio-fiber does *not* preempt; it's the fiber's job to
+    /// poll and bail out cooperatively.
+    pub fn cancel(&self) {
+        self.cancelled.set(true);
+    }
+
+    /// Whether [`Fiber::cancel`] has been called.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.get()
+    }
+
+    /// Whether the deadline (if any) has been reached.
+    pub fn is_deadline_passed(&self) -> bool {
+        match self.deadline_ms {
+            Some(d) => current_time_ms() >= d,
+            None => false,
+        }
+    }
+
+    /// Resume the fiber, passing `input` into it. The fiber receives
+    /// the value as the return of its [`yield_value`] call (or via
+    /// [`take_input`] for the first call).
+    ///
+    /// On the way back, [`take_yield_value`] retrieves whatever the
+    /// fiber yielded.
+    pub fn resume_with<I: 'static>(&mut self, input: I) -> FiberStep {
+        self.input_slot
+            .set(Some(Box::new(input) as Box<dyn Any + 'static>));
+        self.resume()
+    }
+
+    /// Take the value the fiber most recently yielded. Returns
+    /// `Some(v)` if the fiber yielded a `T` and the value hasn't
+    /// already been taken; `None` otherwise (no yield, wrong type,
+    /// or already consumed).
+    pub fn take_yield_value<O: 'static>(&self) -> Option<O> {
+        self.output_slot
+            .take()
+            .and_then(|b| b.downcast::<O>().ok().map(|b| *b))
+    }
+
+    /// Lifecycle state of this fiber. See [`FiberState`].
+    pub fn state(&self) -> FiberState {
+        match (self.started, self.done, self.errored) {
+            (false, _, _) => FiberState::New,
+            (true, false, _) => FiberState::Suspended,
+            (true, true, false) => FiberState::Done,
+            (true, true, true) => FiberState::Errored,
+        }
+    }
+
+    /// Whether the fiber has reached a terminal state (Done or
+    /// Errored). Equivalent to `matches!(state, Done | Errored)`.
     pub fn is_done(&self) -> bool {
         self.done
     }
 
-    /// Continue running the fiber until it yields or returns.
+    /// Take the panic payload from a fiber that finished in
+    /// [`FiberState::Errored`]. Returns `None` if the fiber didn't
+    /// error or the payload has already been taken.
+    pub fn take_error(&mut self) -> Option<Box<dyn Any + Send + 'static>> {
+        self.error_payload.take()
+    }
+
+    /// Continue running the fiber until it yields or terminates.
     ///
     /// # Panics
-    /// Panics if the fiber has already returned (`Done` from a
-    /// previous resume).
+    /// Panics if the fiber is already in a terminal state (`Done` /
+    /// `Errored`).
     pub fn resume(&mut self) -> FiberStep {
-        assert!(!self.done, "Fiber: cannot resume a fiber that has Done");
+        assert!(
+            !self.done,
+            "Fiber: cannot resume a fiber in {:?} state",
+            self.state()
+        );
 
         // Re-wire the trampoline back-pointers in case the Fiber
         // moved between construction and the first resume (which
         // would invalidate the &mut self.done etc. pointers).
         self._trampoline_state.done_flag = &mut self.done as *mut bool;
+        self._trampoline_state.errored_flag = &mut self.errored as *mut bool;
+        self._trampoline_state.error_payload_slot = &mut self.error_payload as *mut _;
         self._trampoline_state.caller_sp_slot = &mut self.caller_sp as *mut *mut u8;
         self._trampoline_state.fiber_sp_slot = &mut self.fiber_sp as *mut *mut u8;
+
+        self.started = true;
 
         let prev_active = ACTIVE_TRAMPOLINE.with(|cell| {
             let prev = cell.get();
             cell.set(&mut *self._trampoline_state as *mut _);
+            prev
+        });
+        let prev_fiber = ACTIVE_FIBER.with(|cell| {
+            let prev = cell.get();
+            cell.set(self as *mut Fiber);
             prev
         });
 
@@ -159,11 +319,12 @@ impl Fiber {
         }
 
         ACTIVE_TRAMPOLINE.with(|cell| cell.set(prev_active));
+        ACTIVE_FIBER.with(|cell| cell.set(prev_fiber));
 
-        if self.done {
-            FiberStep::Done
-        } else {
-            FiberStep::Yielded
+        match (self.done, self.errored) {
+            (false, _) => FiberStep::Yielded,
+            (true, false) => FiberStep::Done,
+            (true, true) => FiberStep::Errored,
         }
     }
 }
@@ -192,6 +353,98 @@ pub fn yield_now() {
     unsafe {
         krio_fiber_switch(fiber_sp_slot, caller_sp_slot as *const *mut u8);
     }
+}
+
+/// Yield from the current fiber, sending `value` out to the host
+/// (retrievable via [`Fiber::take_yield_value`]) and returning
+/// whatever the host passes in via [`Fiber::resume_with`] on the
+/// next call.
+///
+/// Returns `None` if the host called plain [`Fiber::resume`] (no
+/// input set) or if the input couldn't be downcast to `I`.
+///
+/// # Panics
+/// Panics if called outside a fiber.
+pub fn yield_value<O: 'static, I: 'static>(value: O) -> Option<I> {
+    let fiber_ptr = ACTIVE_FIBER.with(|cell| cell.get());
+    assert!(
+        !fiber_ptr.is_null(),
+        "yield_value: called outside of any active fiber"
+    );
+    // SAFETY: ACTIVE_FIBER is only ever set to a `&mut Fiber`
+    // pointer that lives on the host stack until resume returns.
+    unsafe {
+        (*fiber_ptr)
+            .output_slot
+            .set(Some(Box::new(value) as Box<dyn Any + 'static>));
+    }
+    yield_now();
+    let received = unsafe { (*fiber_ptr).input_slot.take() };
+    received.and_then(|b| b.downcast::<I>().ok().map(|b| *b))
+}
+
+/// Take whatever input the host most recently passed via
+/// [`Fiber::resume_with`]. Useful for the "first call" case where
+/// `yield_value` hasn't been invoked yet but the closure wants to
+/// see the initial argument.
+///
+/// Returns `None` if the host used plain [`Fiber::resume`] or if
+/// the input couldn't be downcast to `I`.
+///
+/// # Panics
+/// Panics if called outside a fiber.
+pub fn take_input<I: 'static>() -> Option<I> {
+    let fiber_ptr = ACTIVE_FIBER.with(|cell| cell.get());
+    assert!(
+        !fiber_ptr.is_null(),
+        "take_input: called outside of any active fiber"
+    );
+    let received = unsafe { (*fiber_ptr).input_slot.take() };
+    received.and_then(|b| b.downcast::<I>().ok().map(|b| *b))
+}
+
+/// True if the currently running fiber has been cancelled. Returns
+/// `false` from the host thread (never cancelled).
+///
+/// # Panics
+/// Does not panic — returns `false` outside any fiber. Different
+/// from [`yield_now`] which panics, because cancellation polling is
+/// idiomatic in helper functions that may be called from either
+/// fiber or non-fiber contexts.
+pub fn is_cancelled() -> bool {
+    let fiber_ptr = ACTIVE_FIBER.with(|cell| cell.get());
+    if fiber_ptr.is_null() {
+        return false;
+    }
+    // SAFETY: `fiber_ptr` is set by `Fiber::resume` to `&mut *self`
+    // and is restored on return. Only this thread can see it.
+    unsafe { (*fiber_ptr).cancelled.get() }
+}
+
+/// True if the currently running fiber has a deadline that has
+/// already passed. Returns `false` from the host thread.
+pub fn is_deadline_passed() -> bool {
+    let fiber_ptr = ACTIVE_FIBER.with(|cell| cell.get());
+    if fiber_ptr.is_null() {
+        return false;
+    }
+    unsafe { (*fiber_ptr).is_deadline_passed() }
+}
+
+/// True if the currently running fiber should yield/return early —
+/// i.e. it's been cancelled, or its deadline has passed. The common
+/// "cooperative bail" check.
+pub fn should_yield_early() -> bool {
+    is_cancelled() || is_deadline_passed()
+}
+
+/// Current Unix time in milliseconds. Used for deadline checks.
+fn current_time_ms() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0)
 }
 
 /// Lay out a fresh fiber stack so a `krio_fiber_switch` *into* it
@@ -306,16 +559,18 @@ extern "C" fn fiber_run(state_ptr: *mut TrampolineState) -> ! {
     // / Fiber::resume; valid for the fiber's lifetime.
     let state = unsafe { &mut *state_ptr };
 
-    // Take the closure out of the state. Catch panics so a panicking
-    // fiber doesn't unwind through the asm switch (which would be UB).
+    // Take the closure out of the state. `catch_unwind` is mandatory
+    // here — letting a panic unwind across the asm switch is UB
+    // (the unwinder follows DWARF, which doesn't know our switch
+    // happened). Captured payload is parked on the parent fiber so
+    // the host can retrieve it via `Fiber::take_error`.
     if let Some(closure) = state.closure.take() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(closure));
         if let Err(panic) = result {
-            // We don't have a great place to surface this in the
-            // current API. Print and abort — better than silently
-            // continuing or unwinding through asm.
-            eprintln!("krio-fiber: fiber panicked: {panic:?}");
-            std::process::abort();
+            unsafe {
+                *state.errored_flag = true;
+                *state.error_payload_slot = Some(panic);
+            }
         }
     }
 
@@ -340,7 +595,9 @@ impl Task for Fiber {
     fn step(&mut self) -> Suspension {
         match self.resume() {
             FiberStep::Yielded => Suspension::Yielded,
-            FiberStep::Done => Suspension::Completed,
+            // Errored fibers are "done" from the scheduler's
+            // perspective — they won't make further progress.
+            FiberStep::Done | FiberStep::Errored => Suspension::Completed,
         }
     }
 }

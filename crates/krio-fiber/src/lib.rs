@@ -25,15 +25,34 @@
 //!
 //! ## Status
 //!
-//! - x86_64 + aarch64 context-switch implemented (System V / AAPCS64).
+//! - x86_64 + aarch64 context-switch (System V / AAPCS64).
 //! - Single-threaded; `Fiber` is `!Send`.
-//! - Stack allocated as a heap `Box<[u8]>`. An `mmap`-backed variant
-//!   with a guard page is a reasonable follow-up; the API stays the
-//!   same.
-//! - Bidirectional value passing (`call(input) -> Output` per Wren)
-//!   not yet implemented — the current API is unit-typed yields. Add
-//!   an extra typed channel if you need it; the underlying switch is
-//!   already in place.
+//! - **Unix**: stacks allocated via `mmap` with a `PROT_NONE` guard
+//!   page below the usable region — stack overflow traps with
+//!   SIGSEGV instead of silently corrupting unrelated heap data.
+//! - **Other targets**: heap-allocated `Box<[u8]>` (no guard page).
+//! - Bidirectional value passing via [`Fiber::resume_with`] /
+//!   [`Fiber::take_yield_value`] / [`yield_value`] / [`take_input`].
+//!   Untyped channel — values are `Box<dyn Any>`; downcast to
+//!   recover the type.
+//! - Lifecycle: [`FiberState::New`] / `Suspended` / `Done` /
+//!   `Errored`. Panics inside the fiber are caught at the trampoline
+//!   boundary, parked on the fiber, and surfaced via
+//!   [`FiberStep::Errored`] + [`Fiber::take_error`].
+//! - Cooperative cancellation: [`Fiber::cancel`] sets a flag the
+//!   fiber polls via [`is_cancelled`] / [`should_yield_early`].
+//! - Optional absolute deadlines: [`Fiber::set_deadline_ms`] +
+//!   [`is_deadline_passed`].
+//! - Nested fibers work — a fiber can drive another fiber from
+//!   inside its own body; yields nest through the caller chain
+//!   automatically via [`Fiber::resume`]'s prev_active save/restore.
+//!
+//! ## Not yet implemented
+//!
+//! - Symmetric `transfer` semantics (abandon the current fiber's
+//!   continuation, switch to a peer with the original caller). The
+//!   nested-call form covers most use cases.
+//! - Targets beyond x86_64 + aarch64.
 //!
 //! ## Where this fits in the krio family
 //!
@@ -45,5 +64,9 @@
 
 mod arch;
 mod fiber;
+mod stack;
 
-pub use fiber::{DEFAULT_STACK_SIZE, Fiber, FiberStep, yield_now};
+pub use fiber::{
+    DEFAULT_STACK_SIZE, Fiber, FiberState, FiberStep, is_cancelled, is_deadline_passed,
+    should_yield_early, take_input, yield_now, yield_value,
+};
