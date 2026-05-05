@@ -47,7 +47,7 @@ tasks (per-fiber stack, but suspension Just Works).
 | `krio-stackless` | ✅ shipped — CooperativeExecutor + WakerExecutor |
 | `krio-fiber`     | ✅ shipped — Fiber on x86_64 + aarch64 |
 | `krio-async`     | ✅ Phase 3 — direct-yield + captures lift + cross-fn dispatch |
-| `krio-preempt`   | 🚧 planned (stub)  |
+| `krio-preempt`   | 🟨 v1 — TimeSliceScheduler (cooperative slicing); real signal preempt deferred |
 
 ## Tradeoffs at a glance
 

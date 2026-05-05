@@ -4,11 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Preemptive scheduler over krio-fiber (planned). Timer-driven context switch, not cooperative yield."
+description = "Time-slicing scheduler over krio-fiber. Cooperative slicing today (deadline-driven yields); real signal-based preemption planned."
 
 [dependencies]
 krio-core = { workspace = true }
 krio-fiber = { workspace = true }
+
+[dev-dependencies]
 
 [lints]
 workspace = true
