@@ -46,7 +46,7 @@ tasks (per-fiber stack, but suspension Just Works).
 | `krio-runtime`   | ✅ shipped — RoundRobin scheduler |
 | `krio-stackless` | ✅ shipped — CooperativeExecutor + WakerExecutor |
 | `krio-fiber`     | ✅ shipped — Fiber on x86_64 + aarch64 |
-| `krio-async`     | 🚧 planned (stub)  |
+| `krio-async`     | 🟨 Phase 1 — type contract shipped, lowering pending |
 | `krio-preempt`   | 🚧 planned (stub)  |
 
 ## Tradeoffs at a glance
