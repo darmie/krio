@@ -70,11 +70,13 @@
 
 extern crate alloc;
 
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Debug;
 use core::hash::Hash;
 
 pub use krio_core::{CfgId, Marker, Suspension};
+pub use krio_stackless::CoroCfg;
 
 /// Process-unique IDs the host uses to refer to functions / methods
 /// in its program. Treated as opaque handles by krio-async.
@@ -104,6 +106,53 @@ pub trait SuspendingFns {
     /// gets the [`BlockKind::DirectYield`] lowering instead of the
     /// cross-fn dispatch.
     fn is_yield_primitive(&self, fn_id: Self::FnId) -> bool;
+}
+
+/// One suspension site identified by [`AsyncHooks::classify`].
+/// Either a direct yield-primitive call or a cross-function call
+/// to another tainted callee.
+pub enum SuspensionSite<F: FnId, V: CfgId> {
+    /// Direct call to a yield primitive (`Fiber.yield(_)`,
+    /// `await`, `suspend`). The yielded value (if any) is the
+    /// host-tracked slot — krio-async records it but doesn't emit
+    /// the actual Return; the host's lowering does.
+    DirectYield {
+        /// Slot holding the yielded value, if the language passes
+        /// one. `None` for yield-without-value primitives.
+        value: Option<V>,
+    },
+    /// Call to a function the host has flagged as suspending. The
+    /// transform splits at this point so the dispatcher can resume
+    /// after the callee finishes.
+    CrossFnCall {
+        callee: F,
+        receiver: Option<V>,
+        args: Vec<V>,
+        result: V,
+    },
+}
+
+/// Host-implemented IR hooks the transform needs to inspect the CFG.
+/// `AsyncHooks` complements [`SuspendingFns`]: the latter answers
+/// "may this *function* suspend"; this trait answers "is this
+/// *statement* a suspension point, and what kind".
+pub trait AsyncHooks {
+    type Cfg: krio_stackless::CoroCfg;
+    type FnId: FnId;
+
+    /// Classify the statement at `(bb, idx)` as a suspension site
+    /// or `None` if it isn't one.
+    ///
+    /// The transform invokes this once per statement during the
+    /// scan phase. Implementations should be cheap — typically
+    /// just match the statement's discriminant against "is this a
+    /// Call, and is the callee in the suspending set".
+    fn classify(
+        &self,
+        cfg: &Self::Cfg,
+        bb: <Self::Cfg as krio_stackless::CoroCfg>::BlockId,
+        idx: usize,
+    ) -> Option<SuspensionSite<Self::FnId, <Self::Cfg as krio_stackless::CoroCfg>::LocalId>>;
 }
 
 /// What kind of suspension a block represents. The block's final
@@ -223,35 +272,56 @@ pub enum TransformError<B: CfgId, V: CfgId> {
 
 /// Transform a function's CFG into a state-machine layout.
 ///
-/// **Phase 1**: this is currently a stub. It returns
-/// [`TransformError::Unimplemented`] for any non-trivial input. The
-/// API contract is stable so a host can wire it in now and start
-/// using direct-yield lowering when Phase 2 lands.
+/// **Phase 2 v1** — direct yields only:
 ///
-/// `fn_id` is the function being transformed; the transform asks
-/// `suspending.is_suspending(fn_id)` to decide whether to emit a
-/// state machine at all (a function not in the suspending set
-/// lowers as ordinary code with no transform).
+/// - Refuses cross-function calls to suspending callees with
+///   [`TransformError::Unimplemented`] (Phase 3 covers them).
+/// - Refuses values that live across a suspension with
+///   [`TransformError::LiveValueAcrossSuspension`] — Phase 2 v2
+///   adds the captures-to-fields lift. v1 expects every value
+///   used after a yield to be (re)defined after the yield too.
+/// - Refuses suspensions that aren't the last statement of their
+///   block with [`TransformError::SuspensionInBranchedBlock`] —
+///   v1 only handles the linear case where the block ends with
+///   the yield. v2 will split mid-block.
 ///
-/// `inspect_call` is a host callback for inspecting Call statements
-/// at given (block, statement) positions — Phase 3 needs it to
-/// classify cross-fn calls. Phase 1 doesn't actually invoke it.
-pub fn transform_to_state_machine<C, V, F, S>(
-    _cfg: &mut C,
-    _fn_id: F,
+/// The transform mutates `cfg` by splitting each yield's block
+/// after the yield's index — the new (initially empty) block
+/// becomes the resume entry for that state. The original block
+/// keeps the yield as its tail, ready for the host's lowering to
+/// rewrite the terminator as "save state, kind=Yield, return".
+///
+/// On success, the returned [`StateMachineLayout`] tells the host:
+/// - `resume_entries[0]` = the original entry block (state 0)
+/// - `resume_entries[i]` = the block to enter at state `i`
+/// - `yield_blocks[i]` = `(block, next_state)` — block whose
+///   Return should advance to `next_state` and stamp kind=Yield
+/// - `block_kinds[i]` = `(block, BlockKind)` — the lowering shape
+///
+/// The host emits the dispatcher prologue itself (it knows how to
+/// load `state_id` from its runtime — typically a fiber-frame helper
+/// call krio-async deliberately doesn't model).
+pub fn transform_to_state_machine<S, H>(
+    cfg: &mut H::Cfg,
+    fn_id: H::FnId,
     suspending: &S,
-) -> Result<StateMachineLayout<C, V, F>, TransformError<C, V>>
+    hooks: &H,
+) -> Result<
+    StateMachineLayout<
+        <H::Cfg as krio_stackless::CoroCfg>::BlockId,
+        <H::Cfg as krio_stackless::CoroCfg>::LocalId,
+        H::FnId,
+    >,
+    TransformError<
+        <H::Cfg as krio_stackless::CoroCfg>::BlockId,
+        <H::Cfg as krio_stackless::CoroCfg>::LocalId,
+    >,
+>
 where
-    C: CfgId,
-    V: CfgId,
-    F: FnId,
-    S: SuspendingFns<FnId = F>,
+    S: SuspendingFns<FnId = H::FnId>,
+    H: AsyncHooks,
 {
-    // Honour the contract for non-suspending fns — they don't need
-    // a transform and Phase 1 can answer correctly: the trivial
-    // (empty) layout is fine because the host won't emit any
-    // suspension scaffolding for them.
-    if !suspending.is_suspending(_fn_id) {
+    if !suspending.is_suspending(fn_id) {
         return Ok(StateMachineLayout {
             resume_entries: Vec::new(),
             yield_blocks: Vec::new(),
@@ -260,5 +330,61 @@ where
             block_kinds: Vec::new(),
         });
     }
-    Err(TransformError::Unimplemented)
+
+    // Snapshot block IDs before splitting — `cfg.block_ids()` would
+    // grow as we split, but we only want to scan the original
+    // function body, not the new resume blocks.
+    let original_blocks: Vec<_> = cfg.block_ids();
+    let entry_block = *original_blocks
+        .first()
+        .expect("krio-async: cfg has no blocks");
+
+    // Pass 1 — scan + classify + validate.
+    // Vec of (block, idx_at_scan_time, site, count_at_scan_time).
+    let mut sites = Vec::new();
+    for &bb in &original_blocks {
+        let count = cfg.statement_count(bb);
+        for idx in 0..count {
+            if let Some(site) = hooks.classify(cfg, bb, idx) {
+                // v1 cap: must be the last statement in the block.
+                // Lifts in v2 (split mid-block, replicate post-yield
+                // tail across control-flow successors).
+                if idx + 1 != count {
+                    return Err(TransformError::SuspensionInBranchedBlock { block: bb });
+                }
+                // v1 cap: cross-fn calls are Phase 3.
+                if matches!(site, SuspensionSite::CrossFnCall { .. }) {
+                    return Err(TransformError::Unimplemented);
+                }
+                sites.push((bb, idx, site));
+            }
+        }
+    }
+
+    // Pass 2 — split each yield's block. Since v1 caps require one
+    // suspension per block at the tail, every split is independent
+    // — order doesn't matter and indices stay valid.
+    let mut resume_entries = vec![entry_block];
+    let mut yield_blocks = Vec::new();
+    let mut block_kinds = Vec::new();
+
+    for (bb, idx, _site) in sites {
+        // split_after at the last index produces an empty new block
+        // that inherits bb's terminator. The new block is the resume
+        // entry; bb keeps the yield as its tail.
+        let resume = cfg.split_after(bb, idx);
+        let next_state = resume_entries.len() as u32;
+        resume_entries.push(resume);
+        yield_blocks.push((bb, next_state));
+        block_kinds.push((bb, BlockKind::DirectYield));
+    }
+
+    Ok(StateMachineLayout {
+        resume_entries,
+        yield_blocks,
+        // v2 will populate these.
+        yield_saves: Vec::new(),
+        resume_loads: Vec::new(),
+        block_kinds,
+    })
 }

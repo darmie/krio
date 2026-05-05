@@ -13,20 +13,33 @@ function. Locals that live across a suspension are lifted from
 stack slots into a per-frame slot table on a runtime fiber-style
 frame stack.
 
-## Status — Phase 1
+## Status — Phase 2 v1
 
-The public **type contract** is in. Hosts can wire their IR to the
-trait surfaces (`SuspendingFns`, `BlockKind`, `StateMachineLayout`,
-`FrameState`, `TransformError`) and call `transform_to_state_machine`
-today. For a function the host marks non-suspending, the call
-returns a trivial layout. For a suspending function, it returns
-`TransformError::Unimplemented` until Phase 2 lands the lowering.
+The direct-yield lowering is in. Hosts wire their IR up by
+implementing `krio-stackless::CoroCfg` for their CFG and `AsyncHooks`
+for marker classification, then call `transform_to_state_machine`.
+For each yielding function the transform splits at every yield
+site, returns the layout (`resume_entries`, `yield_blocks`,
+`block_kinds`), and the host's codegen reads it to emit the
+dispatcher prologue and per-block lowering.
 
 | Phase | What it gives you | Status |
 |---|---|---|
 | **1** | Public type contract + stub | ✅ shipped |
-| **2** | Direct-yield lowering (no cross-fn) | planned |
+| **2 v1** | Direct-yield split (one yield per block, at tail; no cross-fn) | ✅ shipped |
+| **2 v2** | Captures-to-fields lift + mid-block yield | planned |
 | **3** | Cross-function call dispatch | planned |
+
+### v1 caps (refused with `TransformError`)
+
+- **`SuspensionInBranchedBlock`** — yield is not the last statement
+  in its block. v2 will split mid-block by replicating the post-yield
+  tail across control-flow successors.
+- **`LiveValueAcrossSuspension`** — a value defined before a yield
+  is used after it. v2 adds the captures lift via `yield_saves` /
+  `resume_loads` (currently always empty in the layout).
+- **`Unimplemented`** — `SuspensionSite::CrossFnCall` classification.
+  Phase 3 handles cross-function dispatch.
 
 The design is a generalised port of the AOT state-machine lowering
 in the `wren_lift` Wren JIT/AOT runtime — that codebase already
