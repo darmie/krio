@@ -242,38 +242,204 @@ fn yield_in_middle_of_block_is_v1_capped() {
     ));
 }
 
-#[test]
-fn cross_fn_call_is_v1_capped() {
-    // A site that classifies as CrossFnCall is Phase 3 — v1 refuses.
-    struct CrossFnHooks;
-    impl AsyncHooks for CrossFnHooks {
-        type Cfg = ToyCfg;
-        type FnId = ToyFnId;
-        fn classify(
-            &self,
-            _cfg: &ToyCfg,
-            _bb: ToyBlockId,
-            _idx: usize,
-        ) -> Option<SuspensionSite<ToyFnId, ToyValueId>> {
-            // Always classify as a cross-fn call — exercises the cap.
+// ── Phase 3: cross-fn call dispatch ───────────────────────────────
+
+/// Hook that classifies a chosen statement index as a cross-fn call.
+struct CrossFnAt {
+    bb: ToyBlockId,
+    idx: usize,
+    callee: ToyFnId,
+    args: Vec<ToyValueId>,
+    result: ToyValueId,
+}
+impl AsyncHooks for CrossFnAt {
+    type Cfg = ToyCfg;
+    type FnId = ToyFnId;
+    fn classify(
+        &self,
+        _cfg: &ToyCfg,
+        bb: ToyBlockId,
+        idx: usize,
+    ) -> Option<SuspensionSite<ToyFnId, ToyValueId>> {
+        if bb == self.bb && idx == self.idx {
             Some(SuspensionSite::CrossFnCall {
-                callee: ToyFnId(99),
+                callee: self.callee,
                 receiver: None,
-                args: vec![],
-                result: ToyValueId(0),
+                args: self.args.clone(),
+                result: self.result,
             })
+        } else {
+            None
         }
     }
+}
 
+#[test]
+fn cross_fn_call_creates_init_resume_pair() {
+    // Block: [setup, call, post]. Cross-fn at idx=1 — split should
+    // yield: bb0 = [setup, call], post_call = [post]; resume_check
+    // is a fresh synthetic block. block_kinds gets two entries:
+    // CrossFnCallInit at bb0 + CrossFnCallResume at resume_check.
     let mut cfg = ToyCfg::new();
-    cfg.push_block(vec![ToyStmt::User("call_to_other_fn")]);
+    let bb0 = cfg.push_block(vec![
+        ToyStmt::User("setup"),
+        ToyStmt::User("call"),
+        ToyStmt::User("post"),
+    ]);
 
     let suspending = ToySuspending {
         suspending: HashSet::from([ToyFnId(1)]),
         yields: HashSet::new(),
     };
-    let result = transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &CrossFnHooks, &LivenessMap::new());
-    assert!(matches!(result, Err(TransformError::Unimplemented)));
+    let hooks = CrossFnAt {
+        bb: bb0,
+        idx: 1,
+        callee: ToyFnId(99),
+        args: vec![ToyValueId(7)],
+        result: ToyValueId(42),
+    };
+
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &hooks,
+        &LivenessMap::new(),
+    )
+    .unwrap();
+
+    // resume_entries[0] = bb0 (entry); resume_entries[1] = resume_check
+    assert_eq!(layout.resume_entries.len(), 2);
+    let resume_check = layout.resume_entries[1];
+
+    // Yield-blocks records bb0 advancing to state 1 (resume_check).
+    assert_eq!(layout.yield_blocks.len(), 1);
+    assert_eq!(layout.yield_blocks[0], (bb0, 1));
+
+    // Two block_kinds entries — Init at bb0, Resume at resume_check.
+    assert_eq!(layout.block_kinds.len(), 2);
+    let init = &layout.block_kinds[0];
+    let resume = &layout.block_kinds[1];
+
+    assert_eq!(init.0, bb0);
+    match &init.1 {
+        BlockKind::CrossFnCallInit {
+            resume_check_block,
+            args,
+            result,
+            callee,
+            ..
+        } => {
+            assert_eq!(*resume_check_block, resume_check);
+            assert_eq!(*args, vec![ToyValueId(7)]);
+            assert_eq!(*result, ToyValueId(42));
+            assert_eq!(*callee, ToyFnId(99));
+        }
+        other => panic!("expected CrossFnCallInit, got {other:?}"),
+    }
+
+    assert_eq!(resume.0, resume_check);
+    match &resume.1 {
+        BlockKind::CrossFnCallResume {
+            done_block,
+            args,
+            result,
+            callee,
+            ..
+        } => {
+            // done_block is the post-call block — created by the
+            // split; it has the User("post") statement.
+            assert_eq!(*args, vec![ToyValueId(7)]);
+            assert_eq!(*result, ToyValueId(42));
+            assert_eq!(*callee, ToyFnId(99));
+            // Sanity: the done block carries the post-call statement.
+            assert_eq!(cfg.statement_count(*done_block), 1);
+        }
+        other => panic!("expected CrossFnCallResume, got {other:?}"),
+    }
+
+    // The yield block (bb0) keeps statements through the call.
+    assert_eq!(cfg.statement_count(bb0), 2);
+    // The resume_check block starts empty — host emits the helper.
+    assert_eq!(cfg.statement_count(resume_check), 0);
+}
+
+#[test]
+fn cross_fn_with_liveness_loads_at_resume_check() {
+    // Captures-lift integration: live values across a cross-fn call
+    // are saved before the Init's Return and loaded at the
+    // resume_check block (NOT the post-call block).
+    let mut cfg = ToyCfg::new();
+    let bb0 = cfg.push_block(vec![
+        ToyStmt::User("setup"),
+        ToyStmt::User("call"),
+        ToyStmt::User("post"),
+    ]);
+
+    let suspending = ToySuspending {
+        suspending: HashSet::from([ToyFnId(1)]),
+        yields: HashSet::new(),
+    };
+    let hooks = CrossFnAt {
+        bb: bb0,
+        idx: 1,
+        callee: ToyFnId(99),
+        args: vec![],
+        result: ToyValueId(0),
+    };
+
+    let mut liveness = LivenessMap::new();
+    liveness.record(bb0, 1, vec![ToyValueId(5)]);
+
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &hooks,
+        &liveness,
+    )
+    .unwrap();
+
+    let resume_check = layout.resume_entries[1];
+    assert_eq!(layout.yield_saves.len(), 1);
+    assert_eq!(layout.yield_saves[0], (bb0, vec![(0, ToyValueId(5))]));
+    assert_eq!(layout.resume_loads.len(), 1);
+    assert_eq!(
+        layout.resume_loads[0],
+        (resume_check, vec![(0, ToyValueId(5))])
+    );
+}
+
+#[test]
+fn cross_fn_call_at_block_tail_works_too() {
+    // Cross-fn calls don't require a post-call statement —
+    // post_call can be empty, host's lowering still wires it up.
+    let mut cfg = ToyCfg::new();
+    let bb0 = cfg.push_block(vec![ToyStmt::User("call_at_tail")]);
+
+    let suspending = ToySuspending {
+        suspending: HashSet::from([ToyFnId(1)]),
+        yields: HashSet::new(),
+    };
+    let hooks = CrossFnAt {
+        bb: bb0,
+        idx: 0,
+        callee: ToyFnId(99),
+        args: vec![],
+        result: ToyValueId(0),
+    };
+
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &hooks,
+        &LivenessMap::new(),
+    )
+    .unwrap();
+
+    assert_eq!(layout.resume_entries.len(), 2);
+    assert_eq!(layout.block_kinds.len(), 2);
 }
 
 #[test]

@@ -13,26 +13,41 @@ function. Locals that live across a suspension are lifted from
 stack slots into a per-frame slot table on a runtime fiber-style
 frame stack.
 
-## Status — Phase 2 v2
+## Status — Phase 3
 
-Direct-yield split + captures-to-fields lift are in. Hosts wire
-their IR up by implementing `krio-stackless::CoroCfg` for their
-CFG and `AsyncHooks` for marker classification, then pass a
-precomputed `LivenessMap` to `transform_to_state_machine`. The
-transform splits at every yield site, allocates slots for live-
-across values, and returns a `StateMachineLayout` with
-`resume_entries`, `yield_blocks`, `yield_saves`, `resume_loads`,
-and `block_kinds`. The host's codegen reads it to emit the
-dispatcher prologue, the per-block lowering, the save/load helper
-calls, and the use rewrites.
+Direct-yield split + captures lift + cross-function call dispatch
+are all in. Hosts wire their IR up by implementing
+`krio-stackless::CoroCfg` and `AsyncHooks`, pass a precomputed
+`LivenessMap`, and get back a `StateMachineLayout` covering all
+three suspension shapes via `BlockKind::{DirectYield,
+CrossFnCallInit, CrossFnCallResume}`.
 
 | Phase | What it gives you | Status |
 |---|---|---|
 | **1** | Public type contract + stub | ✅ shipped |
 | **2 v1** | Direct-yield split | ✅ shipped |
 | **2 v2** | Captures-to-fields lift via `LivenessMap` | ✅ shipped |
-| **3 (was v3)** | Mid-block yield (host-side normalisation preferred) | not planned in krio-async — fixable host-side |
-| **3 (cross-fn)** | Cross-function call dispatch | planned |
+| **3** | Cross-function call dispatch (Init / Resume pair) | ✅ shipped |
+
+For each cross-fn call site the transform:
+1. Splits the source block at the call → `bb` becomes the
+   `CrossFnCallInit` block (statements through the call) and
+   `post_call` (a fresh block) holds the post-call code.
+2. Creates a synthetic `resume_check` block. The dispatcher's
+   `br_table` lands here on resume from a yielded child.
+3. Records `BlockKind::CrossFnCallInit { resume_check_block, ... }`
+   on `bb` and `BlockKind::CrossFnCallResume { done_block, ... }`
+   on `resume_check`.
+4. Runs the captures lift against the `resume_check` block (NOT
+   `post_call`) — saved values are loaded there before the host's
+   helper invokes the child poll fn.
+
+The host's lowering then:
+- In `bb`: emits "advance own state, push child frame, save args,
+  return Pending" instead of the original call.
+- In `resume_check`: emits "invoke child's poll fn, peek kind,
+  on Yield propagate up, on Done pop the child frame and goto
+  `done_block`."
 
 ### What the host owns
 

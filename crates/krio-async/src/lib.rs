@@ -168,6 +168,7 @@ pub trait AsyncHooks {
 ///   dispatcher's switch lands in on resume from a yielded child.
 ///   Invoke the child's poll fn, peek its kind: on Yield, propagate
 ///   up; on Done, pop the child frame and continue at `done_block`.
+#[derive(Debug)]
 pub enum BlockKind<B: CfgId, V: CfgId, F: FnId> {
     DirectYield,
     CrossFnCallInit {
@@ -390,33 +391,112 @@ where
         .expect("krio-async: cfg has no blocks");
 
     // Pass 1 — scan + classify + validate.
+    //
+    // Caps:
+    // - DirectYield must be the last statement in its block. Hosts
+    //   normalise mid-block direct yields before calling.
+    // - CrossFnCall can be anywhere; the split + synthetic resume
+    //   block cover the post-call code path.
+    // - Phase 3 v1 cap: at most one suspension per original block.
+    //   Splitting once per block keeps the position bookkeeping
+    //   trivial; lifting this is straightforward (process splits
+    //   high-to-low) but not in v1.
     let mut sites = Vec::new();
+    let mut seen_blocks = alloc::collections::BTreeSet::new();
     for &bb in &original_blocks {
         let count = cfg.statement_count(bb);
         for idx in 0..count {
             if let Some(site) = hooks.classify(cfg, bb, idx) {
-                if idx + 1 != count {
+                if !seen_blocks.insert(bb) {
                     return Err(TransformError::SuspensionInBranchedBlock { block: bb });
                 }
-                if matches!(site, SuspensionSite::CrossFnCall { .. }) {
-                    return Err(TransformError::Unimplemented);
+                match &site {
+                    SuspensionSite::DirectYield { .. } => {
+                        if idx + 1 != count {
+                            return Err(TransformError::SuspensionInBranchedBlock {
+                                block: bb,
+                            });
+                        }
+                    }
+                    SuspensionSite::CrossFnCall { .. } => {
+                        // No tail requirement — the split + resume
+                        // pair handles post-call code in any position.
+                    }
                 }
                 sites.push((bb, idx, site));
             }
         }
     }
 
-    // Pass 2 — split each yield's block.
+    // Pass 2 — split each suspension's block + record state IDs +
+    // populate block_kinds.
     let mut resume_entries = vec![entry_block];
     let mut yield_blocks = Vec::new();
     let mut block_kinds = Vec::new();
+    // For Pass 3 (captures lift), we need to know which resume entry
+    // corresponds to which (bb, idx) site. DirectYield's resume is
+    // resume_entries[N+1]; cross-fn's resume is the synthetic
+    // resume_check block. Record the index alongside the site.
+    let mut site_resumes: Vec<<H::Cfg as krio_stackless::CoroCfg>::BlockId> =
+        Vec::with_capacity(sites.len());
 
-    for (bb, idx, _site) in &sites {
-        let resume = cfg.split_after(*bb, *idx);
-        let next_state = resume_entries.len() as u32;
-        resume_entries.push(resume);
-        yield_blocks.push((*bb, next_state));
-        block_kinds.push((*bb, BlockKind::DirectYield));
+    for (bb, idx, site) in &sites {
+        match site {
+            SuspensionSite::DirectYield { .. } => {
+                let resume = cfg.split_after(*bb, *idx);
+                let next_state = resume_entries.len() as u32;
+                resume_entries.push(resume);
+                yield_blocks.push((*bb, next_state));
+                block_kinds.push((*bb, BlockKind::DirectYield));
+                site_resumes.push(resume);
+            }
+            SuspensionSite::CrossFnCall {
+                callee,
+                receiver,
+                args,
+                result,
+            } => {
+                // Split: bb keeps [0..=idx], post_call gets [idx+1..]
+                // and inherits bb's terminator.
+                let post_call = cfg.split_after(*bb, *idx);
+                // Synthetic resume_check block — the dispatcher's
+                // br_table lands here on resume from a yielded child.
+                let resume_check = cfg.new_block();
+
+                let next_state = resume_entries.len() as u32;
+                resume_entries.push(resume_check);
+                // bb is a "yields" block: when the host lowers it as
+                // "set state, push child frame, return Pending", the
+                // next_state advance lands the dispatcher in
+                // resume_check next time.
+                yield_blocks.push((*bb, next_state));
+
+                block_kinds.push((
+                    *bb,
+                    BlockKind::CrossFnCallInit {
+                        resume_check_block: resume_check,
+                        receiver: *receiver,
+                        args: args.clone(),
+                        result: *result,
+                        callee: *callee,
+                    },
+                ));
+                block_kinds.push((
+                    resume_check,
+                    BlockKind::CrossFnCallResume {
+                        done_block: post_call,
+                        receiver: *receiver,
+                        args: args.clone(),
+                        result: *result,
+                        callee: *callee,
+                    },
+                ));
+                // Captures lift treats the resume_check block as the
+                // "load" side — values defined before the call must
+                // be reloaded there to be visible after.
+                site_resumes.push(resume_check);
+            }
+        }
     }
 
     // Pass 3 — captures lift. Walk the suspension sites again,
@@ -446,12 +526,8 @@ where
             });
             entries.push((slot, v));
         }
-        // Same slot table on both sides: host saves (slot, v) before
-        // Return and loads (slot) at the resume block, rebinding
-        // uses of v to a fresh local with its own machinery.
         yield_saves.push((*bb, entries.clone()));
-        let resume_bb = resume_entries[i + 1];
-        resume_loads.push((resume_bb, entries));
+        resume_loads.push((site_resumes[i], entries));
     }
 
     Ok(StateMachineLayout {
