@@ -1,0 +1,13 @@
+[package]
+name = "krio-fiber"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stackful Wren/Lua-style fibers (planned). Per-fiber stack allocation, target-specific context-switch primitive, first-class Fiber values, bidirectional call/yield."
+
+[dependencies]
+krio-core = { workspace = true }
+
+[lints]
+workspace = true

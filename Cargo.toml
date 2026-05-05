@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/krio-core",
+    "crates/krio-stackless",
+    "crates/krio-async",
+    "crates/krio-fiber",
+    "crates/krio-preempt",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/darmie/krio"
+description = "Coroutine framework family — stackless transforms, stackful fibers, and preemptive scheduling, sharing a common vocabulary."
+
+[workspace.dependencies]
+krio-core      = { path = "crates/krio-core",      version = "0.1.0" }
+krio-stackless = { path = "crates/krio-stackless", version = "0.1.0" }
+krio-async     = { path = "crates/krio-async",     version = "0.1.0" }
+krio-fiber     = { path = "crates/krio-fiber",     version = "0.1.0" }
+krio-preempt   = { path = "crates/krio-preempt",   version = "0.1.0" }
+
+[workspace.lints.clippy]
+collapsible_if = "allow"
+collapsible_match = "allow"

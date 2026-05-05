@@ -1,0 +1,15 @@
+[package]
+name = "krio-stackless"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MIR-level state-machine transform for stackless coroutines. Generic over any CFG-shaped IR via the CoroCfg / CoroHooks traits; pluggable scheduling via the Executor trait."
+
+[dependencies]
+krio-core = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "krio-preempt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Preemptive scheduler over krio-fiber (planned). Timer-driven context switch, not cooperative yield."
+
+[dependencies]
+krio-core = { workspace = true }
+krio-fiber = { workspace = true }
+
+[lints]
+workspace = true
