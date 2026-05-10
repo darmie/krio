@@ -13,21 +13,23 @@ function. Locals that live across a suspension are lifted from
 stack slots into a per-frame slot table on a runtime fiber-style
 frame stack.
 
-## Status — Phase 3
+## Status — Phase 3 v2
 
 Direct-yield split + captures lift + cross-function call dispatch
-are all in. Hosts wire their IR up by implementing
-`krio-stackless::CoroCfg` and `AsyncHooks`, pass a precomputed
-`LivenessMap`, and get back a `StateMachineLayout` covering all
-three suspension shapes via `BlockKind::{DirectYield,
-CrossFnCallInit, CrossFnCallResume}`.
++ multiple suspensions per original block are all in. Hosts wire
+their IR up by implementing `krio-stackless::CoroCfg` and
+`AsyncHooks`, pass a precomputed `LivenessMap`, and get back a
+`StateMachineLayout` covering all three suspension shapes via
+`BlockKind::{DirectYield, CrossFnCallInit, CrossFnCallResume}` —
+freely interleaved within a single source block.
 
 | Phase | What it gives you | Status |
 |---|---|---|
 | **1** | Public type contract + stub | ✅ shipped |
 | **2 v1** | Direct-yield split | ✅ shipped |
 | **2 v2** | Captures-to-fields lift via `LivenessMap` | ✅ shipped |
-| **3** | Cross-function call dispatch (Init / Resume pair) | ✅ shipped |
+| **3 v1** | Cross-function call dispatch (Init / Resume pair) | ✅ shipped |
+| **3 v2** | Multiple suspensions per source block + mid-block direct yields | ✅ shipped |
 
 For each cross-fn call site the transform:
 1. Splits the source block at the call → `bb` becomes the
@@ -71,14 +73,25 @@ The host's lowering then:
 - The contract: "if you save `(slot, v)` here, you load `slot`
   there."
 
-### Caps still in place
+### Multi-suspension within one block
 
-- **`SuspensionInBranchedBlock`** — yield is not the last statement
-  in its block. The host should normalise its CFG (insert an
-  explicit branch) before calling krio-async; mid-block split is
-  out of scope for the library.
-- **`Unimplemented`** — `SuspensionSite::CrossFnCall`. Phase 3
-  handles cross-function dispatch.
+When a single source block contains several suspensions, each one
+splits the running tail of the previous split:
+
+```text
+Original:    [a, Yield, b, cross_call(f), c, Yield, d]
+After split: bb        = [a, Yield]                     ← yields, state→1
+             tail_y    = [b, cross_call(f)]             ← Init, state→2
+             post_call = [c, Yield]                     ← yields, state→3
+             tail_y2   = [d]
+             resume_check = []                          ← synthetic
+```
+
+Liveness keyed on the *original* `(block, idx)` (e.g. `(bb, 5)`
+for the second yield) is mapped internally to the correct
+post-split yielding block (`post_call`) and resume entry
+(`tail_y2`). Hosts don't need to track splits to write their
+liveness map.
 
 The design is a generalised port of the AOT state-machine lowering
 in the `wren_lift` Wren JIT/AOT runtime — that codebase already
@@ -109,6 +122,8 @@ drive it.
 ## Reference
 
 `/Users/amaterasu/Vibranium/wren_lift/src/codegen/aot_state_machine.rs`
-— the wren_lift implementation. Phase 2 will mirror its `v1` cap
-set (no live-across-suspension values, no suspension inside
-branched blocks) and lift those caps over Phase 3+.
+— the wren_lift implementation. Krio-async tracks the same shape
+(state-machine layout + per-frame slot table) and has now lifted
+all of wren_lift's v1 caps: live-across-suspension values, mid-
+block direct yields, multiple suspensions per source block, and
+cross-function dispatch all work.

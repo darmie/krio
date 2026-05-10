@@ -14,21 +14,24 @@
 //! async's job is to lift the algorithm out of Wren-specific
 //! types so any host compiler can drive it.
 //!
-//! ## Status — Phase 1
+//! ## Status — Phase 3 v2
 //!
-//! Phase 1 is the public **type contract**: hosts can wire their
-//! IR types to the trait surfaces defined here, and the
-//! [`transform_to_state_machine`] entry point compiles and returns
-//! [`TransformError::Unimplemented`]. This is enough for a host to
-//! start integrating without waiting on the body lowering.
+//! All three suspension shapes work end-to-end and any block can
+//! hold any number of them:
 //!
-//! Phase 2 implements the direct-yield split (functions that call
-//! a yield primitive but don't recurse through other suspending
-//! callees) by reusing `krio-stackless`'s state-machine emission.
+//! - **Direct yields** at any position in a block (split moves the
+//!   post-yield tail into the resume entry).
+//! - **Cross-fn calls** to suspending callees, lowered as an
+//!   [`BlockKind::CrossFnCallInit`] / [`BlockKind::CrossFnCallResume`]
+//!   pair around a synthetic resume_check block.
+//! - **Multiple suspensions per original block** in any combination.
+//!   Sites are processed in source order; each split's tail block
+//!   becomes the host of any subsequent suspensions in the same
+//!   original block.
 //!
-//! Phase 3 adds the cross-function dispatch
-//! ([`BlockKind::CrossFnCallInit`] / [`BlockKind::CrossFnCallResume`])
-//! — the genuinely new mechanic over `krio-stackless`.
+//! Liveness is keyed by *original* `(block, idx)` coordinates the
+//! host wrote against the pre-transform CFG; krio-async maps each
+//! site to its post-split yield-block and resume entry internally.
 //!
 //! ## How it relates to the family
 //!
@@ -308,33 +311,37 @@ impl<V> Default for FrameState<V> {
 
 /// Errors the transform can refuse with. Surface these as hard
 /// errors so a host can't silently mis-compile.
+///
+/// The Phase 3 v2 transform has no current error variants — every
+/// pattern Phase 2 v1/v2 capped (mid-block yields, multiple yields
+/// in one block, cross-fn calls) is now handled. The enum is
+/// `#[non_exhaustive]` so future variants can be added without an
+/// API break.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum TransformError<B: CfgId> {
-    /// A suspension call landed inside a block that has statements
-    /// after it. Phase 2 v1/v2 only handle yield-at-tail; v3 will
-    /// split mid-block by replicating the post-yield tail across
-    /// successors. Hosts can also work around this by normalising
-    /// their CFG before calling krio-async.
-    SuspensionInBranchedBlock { block: B },
-    /// A `SuspensionSite::CrossFnCall` was classified — Phase 3
-    /// hasn't landed.
-    Unimplemented,
+    #[doc(hidden)]
+    _Phantom(core::marker::PhantomData<B>),
 }
 
 /// Transform a function's CFG into a state-machine layout.
 ///
-/// **Phase 2 v2** — direct yields with captures lift:
+/// **Phase 3 v2** — direct yields, cross-fn calls, and multiple
+/// suspensions per original block in any combination:
 ///
-/// - Splits each yield's block at the yield, building the
-///   `resume_entries` table.
-/// - Reads `liveness` to find values that cross each suspension,
-///   allocates a slot per unique value across the function, and
-///   populates `yield_saves` (what to save before each yield's
-///   Return) + `resume_loads` (what to load at each resume entry).
-/// - Refuses cross-function calls to suspending callees with
-///   [`TransformError::Unimplemented`] (Phase 3 covers them).
-/// - Refuses suspensions that aren't the last statement of their
-///   block with [`TransformError::SuspensionInBranchedBlock`].
+/// - Splits each suspension's block at the suspension point,
+///   building the `resume_entries` table. Multiple suspensions in
+///   the same original block are processed in source order; each
+///   split's tail block becomes the host of any subsequent
+///   suspensions.
+/// - Reads `liveness` (keyed by *original* `(block, idx)` —
+///   coordinates the host wrote against the pre-transform CFG) to
+///   find values that cross each suspension, allocates a slot per
+///   unique value across the function, and populates `yield_saves`
+///   + `resume_loads`.
+/// - Cross-fn calls produce an `Init` / `Resume` pair around a
+///   synthetic `resume_check` block; captures load at the
+///   `resume_check`, not at the post-call block.
 ///
 /// On success, the host's lowering reads the layout to:
 /// 1. Emit a dispatcher prologue (load state_id, switch to
@@ -390,65 +397,77 @@ where
         .first()
         .expect("krio-async: cfg has no blocks");
 
-    // Pass 1 — scan + classify + validate.
-    //
-    // Caps:
-    // - DirectYield must be the last statement in its block. Hosts
-    //   normalise mid-block direct yields before calling.
-    // - CrossFnCall can be anywhere; the split + synthetic resume
-    //   block cover the post-call code path.
-    // - Phase 3 v1 cap: at most one suspension per original block.
-    //   Splitting once per block keeps the position bookkeeping
-    //   trivial; lifting this is straightforward (process splits
-    //   high-to-low) but not in v1.
-    let mut sites = Vec::new();
-    let mut seen_blocks = alloc::collections::BTreeSet::new();
+    // Pass 1 — scan original blocks once for sites. Coordinates
+    // captured here are pre-transform; downstream liveness lookups
+    // use them directly.
+    let mut sites: Vec<(
+        <H::Cfg as krio_stackless::CoroCfg>::BlockId,
+        usize,
+        SuspensionSite<H::FnId, <H::Cfg as krio_stackless::CoroCfg>::LocalId>,
+    )> = Vec::new();
     for &bb in &original_blocks {
         let count = cfg.statement_count(bb);
         for idx in 0..count {
             if let Some(site) = hooks.classify(cfg, bb, idx) {
-                if !seen_blocks.insert(bb) {
-                    return Err(TransformError::SuspensionInBranchedBlock { block: bb });
-                }
-                match &site {
-                    SuspensionSite::DirectYield { .. } => {
-                        if idx + 1 != count {
-                            return Err(TransformError::SuspensionInBranchedBlock {
-                                block: bb,
-                            });
-                        }
-                    }
-                    SuspensionSite::CrossFnCall { .. } => {
-                        // No tail requirement — the split + resume
-                        // pair handles post-call code in any position.
-                    }
-                }
                 sites.push((bb, idx, site));
             }
         }
     }
 
-    // Pass 2 — split each suspension's block + record state IDs +
-    // populate block_kinds.
+    // Process sites in (original_block, original_idx) ascending
+    // order. Sites in the same original block share a "running"
+    // current_block: the first split moves the post-suspension tail
+    // into a new block, that new block becomes the home of the
+    // next suspension in the same original block, and so on. The
+    // tail block created by a DirectYield split serves both as
+    // (a) the resume entry for the yield and (b) the home of any
+    // later suspensions in the same original block. For CrossFnCall
+    // the resume entry is the synthetic resume_check block, while
+    // the home of later suspensions is the post_call block (the
+    // tail of the split).
+    sites.sort_by_key(|(bb, idx, _)| (*bb, *idx));
+
     let mut resume_entries = vec![entry_block];
     let mut yield_blocks = Vec::new();
     let mut block_kinds = Vec::new();
-    // For Pass 3 (captures lift), we need to know which resume entry
-    // corresponds to which (bb, idx) site. DirectYield's resume is
-    // resume_entries[N+1]; cross-fn's resume is the synthetic
-    // resume_check block. Record the index alongside the site.
+    let mut site_yield_blocks: Vec<<H::Cfg as krio_stackless::CoroCfg>::BlockId> =
+        Vec::with_capacity(sites.len());
     let mut site_resumes: Vec<<H::Cfg as krio_stackless::CoroCfg>::BlockId> =
         Vec::with_capacity(sites.len());
 
-    for (bb, idx, site) in &sites {
+    let mut current_orig_block = entry_block;
+    let mut current_block = entry_block;
+    let mut prev_orig_idx: Option<usize> = None;
+
+    for (orig_bb, orig_idx, site) in &sites {
+        if *orig_bb != current_orig_block || prev_orig_idx.is_none() {
+            current_orig_block = *orig_bb;
+            current_block = *orig_bb;
+            prev_orig_idx = None;
+        }
+
+        // Translate the host's pre-transform `orig_idx` into the
+        // current_block's idx: the previous split removed the
+        // statements through `prev_orig_idx`, so subtract that off.
+        let current_idx = match prev_orig_idx {
+            None => *orig_idx,
+            Some(prev) => *orig_idx - (prev + 1),
+        };
+
         match site {
             SuspensionSite::DirectYield { .. } => {
-                let resume = cfg.split_after(*bb, *idx);
+                let resume = cfg.split_after(current_block, current_idx);
                 let next_state = resume_entries.len() as u32;
                 resume_entries.push(resume);
-                yield_blocks.push((*bb, next_state));
-                block_kinds.push((*bb, BlockKind::DirectYield));
+                yield_blocks.push((current_block, next_state));
+                block_kinds.push((current_block, BlockKind::DirectYield));
+                site_yield_blocks.push(current_block);
                 site_resumes.push(resume);
+
+                // Subsequent suspensions in the same original block
+                // live in `resume`.
+                current_block = resume;
+                prev_orig_idx = Some(*orig_idx);
             }
             SuspensionSite::CrossFnCall {
                 callee,
@@ -456,23 +475,24 @@ where
                 args,
                 result,
             } => {
-                // Split: bb keeps [0..=idx], post_call gets [idx+1..]
-                // and inherits bb's terminator.
-                let post_call = cfg.split_after(*bb, *idx);
+                // Split: current_block keeps [0..=current_idx],
+                // post_call gets the tail and inherits the original
+                // terminator.
+                let post_call = cfg.split_after(current_block, current_idx);
                 // Synthetic resume_check block — the dispatcher's
                 // br_table lands here on resume from a yielded child.
                 let resume_check = cfg.new_block();
 
                 let next_state = resume_entries.len() as u32;
                 resume_entries.push(resume_check);
-                // bb is a "yields" block: when the host lowers it as
-                // "set state, push child frame, return Pending", the
-                // next_state advance lands the dispatcher in
-                // resume_check next time.
-                yield_blocks.push((*bb, next_state));
+                // current_block is a "yields" block: when the host
+                // lowers it as "set state, push child frame, save
+                // args, return Pending", the next_state advance lands
+                // the dispatcher in resume_check next time.
+                yield_blocks.push((current_block, next_state));
 
                 block_kinds.push((
-                    *bb,
+                    current_block,
                     BlockKind::CrossFnCallInit {
                         resume_check_block: resume_check,
                         receiver: *receiver,
@@ -494,7 +514,14 @@ where
                 // Captures lift treats the resume_check block as the
                 // "load" side — values defined before the call must
                 // be reloaded there to be visible after.
+                site_yield_blocks.push(current_block);
                 site_resumes.push(resume_check);
+
+                // Subsequent suspensions in the same original block
+                // live in `post_call` — that's where the post-call
+                // statements went.
+                current_block = post_call;
+                prev_orig_idx = Some(*orig_idx);
             }
         }
     }
@@ -526,7 +553,7 @@ where
             });
             entries.push((slot, v));
         }
-        yield_saves.push((*bb, entries.clone()));
+        yield_saves.push((site_yield_blocks[i], entries.clone()));
         resume_loads.push((site_resumes[i], entries));
     }
 

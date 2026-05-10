@@ -1,8 +1,9 @@
-//! Phase 2 v1 tests: contract surface + the real direct-yield
-//! transform against a minimal toy CFG.
+//! Phase 3 v2 tests: contract surface + direct-yield split,
+//! captures lift, cross-fn dispatch, and multi-suspension within
+//! a single original block (any combination of direct + cross-fn).
 
 use krio_async::{
-    AsyncHooks, BlockKind, FrameState, LivenessMap, SuspendingFns, SuspensionSite, TransformError,
+    AsyncHooks, BlockKind, FrameState, LivenessMap, SuspendingFns, SuspensionSite,
     transform_to_state_machine,
 };
 use krio_stackless::CoroCfg;
@@ -149,6 +150,48 @@ impl AsyncHooks for ToyHooks {
     }
 }
 
+/// Classifies a host-supplied set of (bb, idx) → site mappings.
+/// Lets tests spell out exactly where suspensions live, including
+/// multiple per block in any order.
+struct ScriptedHooks {
+    sites: Vec<(ToyBlockId, usize, SuspensionSite<ToyFnId, ToyValueId>)>,
+}
+impl AsyncHooks for ScriptedHooks {
+    type Cfg = ToyCfg;
+    type FnId = ToyFnId;
+    fn classify(
+        &self,
+        _cfg: &ToyCfg,
+        bb: ToyBlockId,
+        idx: usize,
+    ) -> Option<SuspensionSite<ToyFnId, ToyValueId>> {
+        self.sites.iter().find_map(|(b, i, s)| {
+            if *b == bb && *i == idx {
+                Some(clone_site(s))
+            } else {
+                None
+            }
+        })
+    }
+}
+
+fn clone_site(s: &SuspensionSite<ToyFnId, ToyValueId>) -> SuspensionSite<ToyFnId, ToyValueId> {
+    match s {
+        SuspensionSite::DirectYield { value } => SuspensionSite::DirectYield { value: *value },
+        SuspensionSite::CrossFnCall {
+            callee,
+            receiver,
+            args,
+            result,
+        } => SuspensionSite::CrossFnCall {
+            callee: *callee,
+            receiver: *receiver,
+            args: args.clone(),
+            result: *result,
+        },
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────
 
 #[test]
@@ -218,14 +261,12 @@ fn single_yield_at_block_tail_splits_correctly() {
 }
 
 #[test]
-fn yield_in_middle_of_block_is_v1_capped() {
-    // Yield not at tail → v1 refuses with SuspensionInBranchedBlock
-    // (the term is wren_lift's; "branched" here means "block has
-    // statements after the yield", which for a real IR implies the
-    // block continues past the yield via fall-through into a Branch
-    // or similar).
+fn yield_mid_block_splits_post_yield_tail_into_resume() {
+    // Phase 3 v2: yield in the middle of a block splits the
+    // post-yield code into the resume entry. The yielding block
+    // ends at the yield; the resume block carries everything after.
     let mut cfg = ToyCfg::new();
-    cfg.push_block(vec![
+    let bb0 = cfg.push_block(vec![
         ToyStmt::User("before"),
         ToyStmt::Yield,
         ToyStmt::User("after"),
@@ -235,11 +276,20 @@ fn yield_in_middle_of_block_is_v1_capped() {
         suspending: HashSet::from([ToyFnId(1)]),
         yields: HashSet::new(),
     };
-    let result = transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks, &LivenessMap::new());
-    assert!(matches!(
-        result,
-        Err(TransformError::SuspensionInBranchedBlock { .. })
-    ));
+    let layout =
+        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks, &LivenessMap::new())
+            .expect("v3 handles mid-block direct yield");
+
+    // resume_entries[0] = bb0 (entry); resume_entries[1] = the
+    // tail block created by splitting after the yield.
+    assert_eq!(layout.resume_entries.len(), 2);
+    let resume = layout.resume_entries[1];
+    assert_eq!(layout.yield_blocks, vec![(bb0, 1)]);
+    assert!(matches!(layout.block_kinds[0].1, BlockKind::DirectYield));
+
+    // Yielding block keeps [before, Yield]; resume keeps [after].
+    assert_eq!(cfg.statement_count(bb0), 2);
+    assert_eq!(cfg.statement_count(resume), 1);
 }
 
 // ── Phase 3: cross-fn call dispatch ───────────────────────────────
@@ -603,4 +653,456 @@ fn distinct_values_get_distinct_slots() {
 
     assert_eq!(layout.yield_saves[0].1[0], (0, ToyValueId(1)));
     assert_eq!(layout.yield_saves[1].1[0], (1, ToyValueId(2)));
+}
+
+// ── Phase 3 v2: multiple suspensions per original block ───────────
+
+#[test]
+fn two_direct_yields_in_same_block_chain_through_resume() {
+    // Block: [a, Yield, b, Yield, c]. Two splits — first at idx=1
+    // produces tail_a = [b, Yield, c]; second at tail_a's idx=1
+    // produces tail_b = [c]. yield_blocks attribute the second yield
+    // to tail_a (NOT the original bb).
+    let mut cfg = ToyCfg::new();
+    let bb0 = cfg.push_block(vec![
+        ToyStmt::User("a"),
+        ToyStmt::Yield,
+        ToyStmt::User("b"),
+        ToyStmt::Yield,
+        ToyStmt::User("c"),
+    ]);
+
+    let suspending = ToySuspending {
+        suspending: HashSet::from([ToyFnId(1)]),
+        yields: HashSet::new(),
+    };
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &ToyHooks,
+        &LivenessMap::new(),
+    )
+    .unwrap();
+
+    // resume_entries: [bb0, tail_a, tail_b].
+    assert_eq!(layout.resume_entries.len(), 3);
+    let tail_a = layout.resume_entries[1];
+    let tail_b = layout.resume_entries[2];
+
+    // First yield's yielding block is bb0 advancing to state 1;
+    // second yield's yielding block is tail_a advancing to state 2.
+    assert_eq!(layout.yield_blocks, vec![(bb0, 1), (tail_a, 2)]);
+    assert!(matches!(layout.block_kinds[0].1, BlockKind::DirectYield));
+    assert_eq!(layout.block_kinds[0].0, bb0);
+    assert!(matches!(layout.block_kinds[1].1, BlockKind::DirectYield));
+    assert_eq!(layout.block_kinds[1].0, tail_a);
+
+    // Block contents: bb0=[a, Yield], tail_a=[b, Yield], tail_b=[c].
+    assert_eq!(cfg.statement_count(bb0), 2);
+    assert_eq!(cfg.statement_count(tail_a), 2);
+    assert_eq!(cfg.statement_count(tail_b), 1);
+}
+
+#[test]
+fn three_direct_yields_in_same_block() {
+    // Three suspensions exercise the running-tail bookkeeping over
+    // more than two splits.
+    let mut cfg = ToyCfg::new();
+    let bb0 = cfg.push_block(vec![
+        ToyStmt::Yield,
+        ToyStmt::User("a"),
+        ToyStmt::Yield,
+        ToyStmt::User("b"),
+        ToyStmt::Yield,
+        ToyStmt::User("c"),
+    ]);
+
+    let suspending = ToySuspending {
+        suspending: HashSet::from([ToyFnId(1)]),
+        yields: HashSet::new(),
+    };
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &ToyHooks,
+        &LivenessMap::new(),
+    )
+    .unwrap();
+
+    // 4 resume entries (state 0 + one per yield), 3 yield blocks.
+    assert_eq!(layout.resume_entries.len(), 4);
+    assert_eq!(layout.yield_blocks.len(), 3);
+    assert_eq!(layout.yield_blocks[0].1, 1);
+    assert_eq!(layout.yield_blocks[1].1, 2);
+    assert_eq!(layout.yield_blocks[2].1, 3);
+    // Each yield block ends at its yield: the first split's tail is
+    // the second's host, etc. So bb0=[Yield], tail_1=[a, Yield],
+    // tail_2=[b, Yield], tail_3=[c].
+    assert_eq!(cfg.statement_count(bb0), 1);
+    assert_eq!(cfg.statement_count(layout.resume_entries[1]), 2);
+    assert_eq!(cfg.statement_count(layout.resume_entries[2]), 2);
+    assert_eq!(cfg.statement_count(layout.resume_entries[3]), 1);
+}
+
+#[test]
+fn cross_fn_then_direct_yield_in_same_block() {
+    // bb0 = [setup, cross_call, mid, Yield, post]. The cross-fn
+    // split moves [mid, Yield, post] into post_call; the yield
+    // split inside post_call moves [post] into the final tail.
+    let mut cfg = ToyCfg::new();
+    let bb0 = cfg.push_block(vec![
+        ToyStmt::User("setup"),
+        ToyStmt::User("cross_call"),
+        ToyStmt::User("mid"),
+        ToyStmt::Yield,
+        ToyStmt::User("post"),
+    ]);
+
+    let suspending = ToySuspending {
+        suspending: HashSet::from([ToyFnId(1)]),
+        yields: HashSet::new(),
+    };
+    let hooks = ScriptedHooks {
+        sites: vec![
+            (
+                bb0,
+                1,
+                SuspensionSite::CrossFnCall {
+                    callee: ToyFnId(99),
+                    receiver: None,
+                    args: vec![],
+                    result: ToyValueId(0),
+                },
+            ),
+            (bb0, 3, SuspensionSite::DirectYield { value: None }),
+        ],
+    };
+
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &hooks,
+        &LivenessMap::new(),
+    )
+    .unwrap();
+
+    // resume_entries: [bb0, resume_check, tail_yield].
+    assert_eq!(layout.resume_entries.len(), 3);
+    let resume_check = layout.resume_entries[1];
+    let tail_yield = layout.resume_entries[2];
+
+    // yield_blocks attributes the cross-fn yield to bb0 (state 1)
+    // and the direct yield to post_call (state 2). post_call is the
+    // CrossFnCallResume's done_block.
+    let init_done_block = match &layout.block_kinds[0].1 {
+        BlockKind::CrossFnCallInit { resume_check_block, .. } => *resume_check_block,
+        _ => panic!("expected Init at index 0"),
+    };
+    assert_eq!(init_done_block, resume_check);
+
+    let post_call = match &layout.block_kinds[1].1 {
+        BlockKind::CrossFnCallResume { done_block, .. } => *done_block,
+        _ => panic!("expected Resume at index 1"),
+    };
+
+    assert_eq!(layout.yield_blocks, vec![(bb0, 1), (post_call, 2)]);
+
+    // The DirectYield kind should be attached to post_call.
+    let direct_kind = &layout.block_kinds[2];
+    assert_eq!(direct_kind.0, post_call);
+    assert!(matches!(direct_kind.1, BlockKind::DirectYield));
+
+    // Block contents — bb0=[setup, cross_call], post_call=[mid, Yield],
+    // tail_yield=[post]. resume_check is synthetic and empty.
+    assert_eq!(cfg.statement_count(bb0), 2);
+    assert_eq!(cfg.statement_count(post_call), 2);
+    assert_eq!(cfg.statement_count(tail_yield), 1);
+    assert_eq!(cfg.statement_count(resume_check), 0);
+}
+
+#[test]
+fn direct_yield_then_cross_fn_in_same_block() {
+    // bb0 = [Yield, mid, cross_call, post]. Direct-yield split first
+    // moves [mid, cross_call, post] into tail_y; cross-fn split moves
+    // [post] into post_call.
+    let mut cfg = ToyCfg::new();
+    let bb0 = cfg.push_block(vec![
+        ToyStmt::Yield,
+        ToyStmt::User("mid"),
+        ToyStmt::User("cross_call"),
+        ToyStmt::User("post"),
+    ]);
+
+    let suspending = ToySuspending {
+        suspending: HashSet::from([ToyFnId(1)]),
+        yields: HashSet::new(),
+    };
+    let hooks = ScriptedHooks {
+        sites: vec![
+            (bb0, 0, SuspensionSite::DirectYield { value: None }),
+            (
+                bb0,
+                2,
+                SuspensionSite::CrossFnCall {
+                    callee: ToyFnId(99),
+                    receiver: None,
+                    args: vec![],
+                    result: ToyValueId(0),
+                },
+            ),
+        ],
+    };
+
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &hooks,
+        &LivenessMap::new(),
+    )
+    .unwrap();
+
+    // resume_entries: [bb0, tail_y, resume_check].
+    assert_eq!(layout.resume_entries.len(), 3);
+    let tail_y = layout.resume_entries[1];
+    let resume_check = layout.resume_entries[2];
+
+    // yield_blocks: (bb0 → 1, tail_y → 2). The cross-fn's Init lives
+    // on tail_y, not bb0.
+    assert_eq!(layout.yield_blocks, vec![(bb0, 1), (tail_y, 2)]);
+
+    // First entry: bb0 → DirectYield.
+    assert_eq!(layout.block_kinds[0].0, bb0);
+    assert!(matches!(layout.block_kinds[0].1, BlockKind::DirectYield));
+
+    // Second entry: tail_y → CrossFnCallInit. Pull resume_check_block
+    // out and confirm it matches resume_entries[2].
+    match &layout.block_kinds[1] {
+        (b, BlockKind::CrossFnCallInit { resume_check_block, .. }) => {
+            assert_eq!(*b, tail_y);
+            assert_eq!(*resume_check_block, resume_check);
+        }
+        other => panic!("expected (tail_y, CrossFnCallInit), got {other:?}"),
+    }
+
+    // Third entry: resume_check → CrossFnCallResume{done_block=post_call}.
+    let post_call = match &layout.block_kinds[2] {
+        (b, BlockKind::CrossFnCallResume { done_block, .. }) => {
+            assert_eq!(*b, resume_check);
+            *done_block
+        }
+        other => panic!("expected (resume_check, CrossFnCallResume), got {other:?}"),
+    };
+
+    // Contents: bb0=[Yield], tail_y=[mid, cross_call],
+    // post_call=[post], resume_check=[].
+    assert_eq!(cfg.statement_count(bb0), 1);
+    assert_eq!(cfg.statement_count(tail_y), 2);
+    assert_eq!(cfg.statement_count(post_call), 1);
+    assert_eq!(cfg.statement_count(resume_check), 0);
+}
+
+#[test]
+fn two_cross_fn_calls_in_same_block_each_get_their_own_resume_check() {
+    // bb0 = [a, call_1, b, call_2, c]. Two cross-fn splits:
+    // first creates post_call_1 + resume_check_1; second splits
+    // post_call_1 into post_call_1=[b, call_2] + post_call_2=[c],
+    // adds resume_check_2.
+    let mut cfg = ToyCfg::new();
+    let bb0 = cfg.push_block(vec![
+        ToyStmt::User("a"),
+        ToyStmt::User("call_1"),
+        ToyStmt::User("b"),
+        ToyStmt::User("call_2"),
+        ToyStmt::User("c"),
+    ]);
+
+    let suspending = ToySuspending {
+        suspending: HashSet::from([ToyFnId(1)]),
+        yields: HashSet::new(),
+    };
+    let hooks = ScriptedHooks {
+        sites: vec![
+            (
+                bb0,
+                1,
+                SuspensionSite::CrossFnCall {
+                    callee: ToyFnId(7),
+                    receiver: None,
+                    args: vec![ToyValueId(70)],
+                    result: ToyValueId(71),
+                },
+            ),
+            (
+                bb0,
+                3,
+                SuspensionSite::CrossFnCall {
+                    callee: ToyFnId(8),
+                    receiver: None,
+                    args: vec![ToyValueId(80)],
+                    result: ToyValueId(81),
+                },
+            ),
+        ],
+    };
+
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &hooks,
+        &LivenessMap::new(),
+    )
+    .unwrap();
+
+    // 3 resume entries (entry, resume_check_1, resume_check_2).
+    assert_eq!(layout.resume_entries.len(), 3);
+    let resume_check_1 = layout.resume_entries[1];
+    let resume_check_2 = layout.resume_entries[2];
+
+    // 4 block_kinds entries: Init1, Resume1, Init2, Resume2.
+    assert_eq!(layout.block_kinds.len(), 4);
+
+    // Init1 at bb0, points at resume_check_1.
+    let post_call_1 = match &layout.block_kinds[0] {
+        (b, BlockKind::CrossFnCallInit { resume_check_block, callee, .. }) => {
+            assert_eq!(*b, bb0);
+            assert_eq!(*resume_check_block, resume_check_1);
+            assert_eq!(*callee, ToyFnId(7));
+            // Resume1 carries the matching done_block.
+            match &layout.block_kinds[1] {
+                (rb, BlockKind::CrossFnCallResume { done_block, callee, .. }) => {
+                    assert_eq!(*rb, resume_check_1);
+                    assert_eq!(*callee, ToyFnId(7));
+                    *done_block
+                }
+                other => panic!("expected Resume1, got {other:?}"),
+            }
+        }
+        other => panic!("expected Init1, got {other:?}"),
+    };
+
+    // Init2 sits on post_call_1.
+    match &layout.block_kinds[2] {
+        (b, BlockKind::CrossFnCallInit { resume_check_block, callee, .. }) => {
+            assert_eq!(*b, post_call_1);
+            assert_eq!(*resume_check_block, resume_check_2);
+            assert_eq!(*callee, ToyFnId(8));
+        }
+        other => panic!("expected Init2 at post_call_1, got {other:?}"),
+    }
+    let post_call_2 = match &layout.block_kinds[3] {
+        (b, BlockKind::CrossFnCallResume { done_block, callee, .. }) => {
+            assert_eq!(*b, resume_check_2);
+            assert_eq!(*callee, ToyFnId(8));
+            *done_block
+        }
+        other => panic!("expected Resume2, got {other:?}"),
+    };
+
+    // Yield-blocks attribute Init1's yield to bb0, Init2's yield to
+    // post_call_1.
+    assert_eq!(layout.yield_blocks, vec![(bb0, 1), (post_call_1, 2)]);
+
+    // Block contents — bb0=[a, call_1], post_call_1=[b, call_2],
+    // post_call_2=[c]. resume_check blocks empty.
+    assert_eq!(cfg.statement_count(bb0), 2);
+    assert_eq!(cfg.statement_count(post_call_1), 2);
+    assert_eq!(cfg.statement_count(post_call_2), 1);
+    assert_eq!(cfg.statement_count(resume_check_1), 0);
+    assert_eq!(cfg.statement_count(resume_check_2), 0);
+}
+
+#[test]
+fn multi_suspension_with_liveness_uses_correct_yield_and_resume_blocks() {
+    // Two yields in one block, each with a distinct live value.
+    // Verify the save lands at the *current* yielding block (not
+    // the original bb0 for the second yield) and the load at the
+    // matching resume entry.
+    let mut cfg = ToyCfg::new();
+    let bb0 = cfg.push_block(vec![
+        ToyStmt::User("a"),
+        ToyStmt::Yield,
+        ToyStmt::User("b"),
+        ToyStmt::Yield,
+    ]);
+
+    let suspending = ToySuspending {
+        suspending: HashSet::from([ToyFnId(1)]),
+        yields: HashSet::new(),
+    };
+
+    // Liveness keyed on original (block, idx).
+    let mut liveness = LivenessMap::new();
+    liveness.record(bb0, 1, vec![ToyValueId(10)]);
+    liveness.record(bb0, 3, vec![ToyValueId(20)]);
+
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &ToyHooks,
+        &liveness,
+    )
+    .unwrap();
+
+    let tail_a = layout.resume_entries[1];
+    let tail_b = layout.resume_entries[2];
+
+    // First yield's save sits on bb0; load on tail_a.
+    assert_eq!(layout.yield_saves[0], (bb0, vec![(0, ToyValueId(10))]));
+    assert_eq!(layout.resume_loads[0], (tail_a, vec![(0, ToyValueId(10))]));
+    // Second yield's save sits on tail_a (NOT bb0); load on tail_b.
+    assert_eq!(layout.yield_saves[1], (tail_a, vec![(1, ToyValueId(20))]));
+    assert_eq!(layout.resume_loads[1], (tail_b, vec![(1, ToyValueId(20))]));
+}
+
+#[test]
+fn multi_suspension_across_blocks_keeps_per_block_state() {
+    // Two original blocks, each with two yields. The current_block
+    // tracking must reset when crossing block boundaries; otherwise
+    // the second block's first yield would inherit stale idx state.
+    let mut cfg = ToyCfg::new();
+    let bb_a = cfg.push_block(vec![
+        ToyStmt::User("a0"),
+        ToyStmt::Yield,
+        ToyStmt::User("a1"),
+        ToyStmt::Yield,
+    ]);
+    let bb_b = cfg.push_block(vec![
+        ToyStmt::User("b0"),
+        ToyStmt::Yield,
+        ToyStmt::User("b1"),
+        ToyStmt::Yield,
+    ]);
+
+    let suspending = ToySuspending {
+        suspending: HashSet::from([ToyFnId(1)]),
+        yields: HashSet::new(),
+    };
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &ToyHooks,
+        &LivenessMap::new(),
+    )
+    .unwrap();
+
+    // 4 yields → 5 resume entries, 4 yield blocks numbered 1..=4.
+    assert_eq!(layout.resume_entries.len(), 5);
+    assert_eq!(layout.yield_blocks.len(), 4);
+    for (i, (_, state)) in layout.yield_blocks.iter().enumerate() {
+        assert_eq!(*state, (i + 1) as u32);
+    }
+
+    // First yield in each block lives on the original bb_a / bb_b;
+    // second yield lives on the tail block created by the first split.
+    assert_eq!(layout.yield_blocks[0].0, bb_a);
+    assert_eq!(layout.yield_blocks[1].0, layout.resume_entries[1]);
+    assert_eq!(layout.yield_blocks[2].0, bb_b);
+    assert_eq!(layout.yield_blocks[3].0, layout.resume_entries[3]);
 }

@@ -18,7 +18,8 @@ krio
 │                       drives any Task to completion
 ├── krio-stackless    — per-function state-machine transform
 │                       (CooperativeExecutor + WakerExecutor)
-├── krio-async        — cross-function stackless (planned)
+├── krio-async        — cross-function stackless state-machine
+│                       transform (function-colour + frame stack)
 ├── krio-fiber        — Wren/Lua-style stackful runtime
 │                       (Fiber implements krio-core::Task)
 └── krio-preempt      — preemptive scheduler (planned)
@@ -46,7 +47,7 @@ tasks (per-fiber stack, but suspension Just Works).
 | `krio-runtime`   | ✅ shipped — RoundRobin scheduler |
 | `krio-stackless` | ✅ shipped — CooperativeExecutor + WakerExecutor |
 | `krio-fiber`     | ✅ shipped — Fiber on x86_64 + aarch64 |
-| `krio-async`     | ✅ Phase 3 — direct-yield + captures lift + cross-fn dispatch |
+| `krio-async`     | ✅ Phase 3 v2 — direct-yield + captures lift + cross-fn dispatch + multi-suspension blocks |
 | `krio-preempt`   | 🟨 v1 — TimeSliceScheduler (cooperative slicing); real signal preempt deferred |
 
 ## Tradeoffs at a glance
