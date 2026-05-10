@@ -261,12 +261,45 @@ impl Fiber {
 
     /// Take the value the fiber most recently yielded. Returns
     /// `Some(v)` if the fiber yielded a `T` and the value hasn't
-    /// already been taken; `None` otherwise (no yield, wrong type,
-    /// or already consumed).
+    /// already been taken; `None` if no value is buffered, or if
+    /// the buffered value isn't a `T` — in which case the value is
+    /// left in place so a subsequent `take_yield_value::<U>()` (or
+    /// [`Fiber::take_yield_any`]) can claim it. This makes
+    /// fall-through dispatch on multiple yield-value types
+    /// ergonomic without losing the value on the first miss.
     pub fn take_yield_value<O: 'static>(&self) -> Option<O> {
-        self.output_slot
-            .take()
-            .and_then(|b| b.downcast::<O>().ok().map(|b| *b))
+        let boxed = self.output_slot.take()?;
+        match boxed.downcast::<O>() {
+            Ok(b) => Some(*b),
+            Err(original) => {
+                // Wrong type — restore the slot so the caller can
+                // try a different `O` next time. Without this,
+                // the value would silently disappear on a type
+                // mismatch.
+                self.output_slot.set(Some(original));
+                None
+            }
+        }
+    }
+
+    /// Take the most recent yield value as an opaque `Box<dyn Any>`,
+    /// leaving the slot empty. Use when the caller wants to drive
+    /// its own downcast logic (e.g. matching across many possible
+    /// yield types) or when the host needs to forward the value
+    /// without inspecting it.
+    pub fn take_yield_any(&self) -> Option<Box<dyn Any + 'static>> {
+        self.output_slot.take()
+    }
+
+    /// Whether the fiber has a yielded value waiting to be taken.
+    /// Cheap; doesn't consume.
+    pub fn has_yield_value(&self) -> bool {
+        // `Cell::take()` would consume; we use a transient
+        // take/set pair to peek without changing observable state.
+        let v = self.output_slot.take();
+        let present = v.is_some();
+        self.output_slot.set(v);
+        present
     }
 
     /// Lifecycle state of this fiber. See [`FiberState`].

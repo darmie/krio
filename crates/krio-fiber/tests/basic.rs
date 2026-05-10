@@ -426,3 +426,56 @@ fn fiber_name_round_trips() {
     fiber.set_name(String::from("renamed"));
     assert_eq!(fiber.name(), Some("renamed"));
 }
+
+#[test]
+fn take_yield_value_wrong_type_preserves_slot() {
+    // The fiber yields an i64. Calling `take_yield_value::<&str>`
+    // must not consume the value — a follow-up
+    // `take_yield_value::<i64>` should still see it. Without the
+    // restore-on-mismatch behaviour the value would silently
+    // disappear on the first wrong-type take.
+    let mut fiber = Fiber::new(|| {
+        let _: Option<()> = yield_value(42i64);
+    });
+    fiber.resume();
+
+    // First peek with the wrong type — should return None and leave
+    // the slot intact.
+    let wrong: Option<&str> = fiber.take_yield_value();
+    assert_eq!(wrong, None);
+
+    // Now the right type — should still find the value.
+    let right: Option<i64> = fiber.take_yield_value();
+    assert_eq!(right, Some(42));
+
+    // After a successful take the slot is empty again.
+    let again: Option<i64> = fiber.take_yield_value();
+    assert_eq!(again, None);
+}
+
+#[test]
+fn has_yield_value_does_not_consume() {
+    let mut fiber = Fiber::new(|| {
+        let _: Option<()> = yield_value("hello");
+    });
+    fiber.resume();
+    assert!(fiber.has_yield_value());
+    // Repeated peeks stay observable.
+    assert!(fiber.has_yield_value());
+    let v: Option<&str> = fiber.take_yield_value();
+    assert_eq!(v, Some("hello"));
+    assert!(!fiber.has_yield_value());
+}
+
+#[test]
+fn take_yield_any_returns_opaque_box() {
+    let mut fiber = Fiber::new(|| {
+        let _: Option<()> = yield_value(7u32);
+    });
+    fiber.resume();
+    let any = fiber.take_yield_any().expect("yield value present");
+    let v: u32 = *any.downcast::<u32>().expect("downcast u32");
+    assert_eq!(v, 7);
+    // After take_yield_any the slot is empty.
+    assert!(!fiber.has_yield_value());
+}
