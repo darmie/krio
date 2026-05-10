@@ -1106,3 +1106,71 @@ fn multi_suspension_across_blocks_keeps_per_block_state() {
     assert_eq!(layout.yield_blocks[2].0, bb_b);
     assert_eq!(layout.yield_blocks[3].0, layout.resume_entries[3]);
 }
+
+#[test]
+fn reserved_slots_offset_captures_lift_allocator() {
+    // Host reserves slots 0..3 for runtime-ABI bookkeeping. krio
+    // must allocate captures-lift slots starting at 3, not 0.
+    use krio_async::{transform_to_state_machine_with_options, TransformOptions};
+
+    let mut cfg = ToyCfg::new();
+    cfg.push_block(vec![ToyStmt::User("compute"), ToyStmt::Yield]);
+
+    let suspending = ToySuspending {
+        suspending: HashSet::from([ToyFnId(1)]),
+        yields: HashSet::new(),
+    };
+
+    let mut liveness = LivenessMap::new();
+    liveness.record(
+        ToyBlockId(0),
+        1,
+        vec![ToyValueId(7), ToyValueId(11)],
+    );
+
+    let layout = transform_to_state_machine_with_options(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &ToyHooks,
+        &liveness,
+        TransformOptions { reserved_slots: 3 },
+    )
+    .unwrap();
+
+    let saves = &layout.yield_saves[0].1;
+    assert_eq!(saves[0], (3, ToyValueId(7)),  "first capture slot starts at reserved_slots, not 0");
+    assert_eq!(saves[1], (4, ToyValueId(11)), "second capture slot is reserved_slots + 1");
+
+    let loads = &layout.resume_loads[0].1;
+    assert_eq!(loads[0], (3, ToyValueId(7)));
+    assert_eq!(loads[1], (4, ToyValueId(11)));
+}
+
+#[test]
+fn validate_layout_accepts_clean_output_from_transform() {
+    use krio_async::validate_layout;
+
+    let mut cfg = ToyCfg::new();
+    cfg.push_block(vec![ToyStmt::User("a"), ToyStmt::Yield, ToyStmt::User("b")]);
+
+    let suspending = ToySuspending {
+        suspending: HashSet::from([ToyFnId(1)]),
+        yields: HashSet::new(),
+    };
+    let mut liveness = LivenessMap::new();
+    liveness.record(ToyBlockId(0), 1, vec![ToyValueId(42)]);
+
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &ToyHooks,
+        &liveness,
+    )
+    .unwrap();
+
+    // Layout produced by krio should always be self-consistent.
+    validate_layout(&layout, /* next_slot = */ 1).expect("transform output must validate");
+}
+

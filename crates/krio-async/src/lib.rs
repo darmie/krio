@@ -81,6 +81,9 @@ use core::hash::Hash;
 pub use krio_core::{CfgId, Marker, Suspension};
 pub use krio_stackless::CoroCfg;
 
+pub mod validate;
+pub use validate::{validate_layout, LayoutError};
+
 /// Process-unique IDs the host uses to refer to functions / methods
 /// in its program. Treated as opaque handles by krio-async.
 pub trait FnId: Copy + Eq + Hash + Debug {}
@@ -360,6 +363,11 @@ pub enum TransformError<B: CfgId> {
 /// Hosts wanting tighter packing (e.g. share slots between
 /// non-overlapping live ranges) can pass a smaller `liveness` and
 /// trust krio-async's allocator.
+///
+/// This function calls [`transform_to_state_machine_with_options`]
+/// with default options. Use the `_with_options` variant if your
+/// host needs to reserve slots for state-id, params, or other
+/// runtime-ABI bookkeeping (see [`TransformOptions`]).
 pub fn transform_to_state_machine<S, H>(
     cfg: &mut H::Cfg,
     fn_id: H::FnId,
@@ -369,6 +377,72 @@ pub fn transform_to_state_machine<S, H>(
         <H::Cfg as krio_stackless::CoroCfg>::BlockId,
         <H::Cfg as krio_stackless::CoroCfg>::LocalId,
     >,
+) -> Result<
+    StateMachineLayout<
+        <H::Cfg as krio_stackless::CoroCfg>::BlockId,
+        <H::Cfg as krio_stackless::CoroCfg>::LocalId,
+        H::FnId,
+    >,
+    TransformError<<H::Cfg as krio_stackless::CoroCfg>::BlockId>,
+>
+where
+    S: SuspendingFns<FnId = H::FnId>,
+    H: AsyncHooks,
+{
+    transform_to_state_machine_with_options(
+        cfg,
+        fn_id,
+        suspending,
+        hooks,
+        liveness,
+        TransformOptions::default(),
+    )
+}
+
+/// Tunables for [`transform_to_state_machine_with_options`].
+///
+/// Hosts that need to reserve slots for runtime-ABI bookkeeping
+/// (state-id, function parameters, scratch space) can use this to
+/// shift krio's slot allocator past the reserved range. Without it,
+/// captures-lift slots are allocated from 0 upward and the host has
+/// to either:
+/// (a) put its bookkeeping at `next_slot..` post-transform, or
+/// (b) avoid the natural `slot=0 means state-id` convention.
+///
+/// Either workaround is brittle. With reservation, the contract is
+/// explicit: krio guarantees no captures-lift slot will fall in
+/// `0..reserved_slots`.
+///
+/// ```text
+///  slot 0 ─┐
+///         ├─ host's reservation (state-id, params, scratch)
+///  N-1   ─┘
+///  N     ─┐
+///         ├─ krio's captures-lift allocation (one per unique LocalId)
+///  ...   ─┘
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct TransformOptions {
+    /// First slot index krio's captures-lift allocator may use.
+    /// Slots `0..reserved_slots` are off-limits — the host owns them.
+    /// Default: 0 (no reservation, krio uses the full slot space).
+    pub reserved_slots: u32,
+}
+
+/// Like [`transform_to_state_machine`] but with explicit options.
+///
+/// Currently the only option is [`TransformOptions::reserved_slots`].
+/// See [`TransformOptions`] for the slot-reservation rationale.
+pub fn transform_to_state_machine_with_options<S, H>(
+    cfg: &mut H::Cfg,
+    fn_id: H::FnId,
+    suspending: &S,
+    hooks: &H,
+    liveness: &LivenessMap<
+        <H::Cfg as krio_stackless::CoroCfg>::BlockId,
+        <H::Cfg as krio_stackless::CoroCfg>::LocalId,
+    >,
+    options: TransformOptions,
 ) -> Result<
     StateMachineLayout<
         <H::Cfg as krio_stackless::CoroCfg>::BlockId,
@@ -535,7 +609,10 @@ where
         <H::Cfg as krio_stackless::CoroCfg>::LocalId,
         u32,
     > = BTreeMap::new();
-    let mut next_slot: u32 = 0;
+    // Captures-lift slot allocator starts at `reserved_slots` so the
+    // host can pre-claim `0..reserved_slots` for runtime-ABI uses
+    // (state-id, params, etc.) without colliding with krio's slots.
+    let mut next_slot: u32 = options.reserved_slots;
     let mut yield_saves = Vec::new();
     let mut resume_loads = Vec::new();
 

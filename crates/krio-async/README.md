@@ -119,6 +119,71 @@ drive it.
    active suspending call owns one frame; the dispatcher reads
    the deepest frame's `state_id` to know where to resume.
 
+## Slot reservation (`TransformOptions::reserved_slots`)
+
+By default krio-async's captures-lift allocator allocates slot
+indices from 0 upward — one slot per unique `LocalId` across the
+function. That works fine when the host doesn't care about specific
+slot numbers, but most real runtimes have ABI-driven uses for
+particular slots (e.g. "slot 0 holds the state-id read by the
+dispatcher's `br_table`", "slots 1..=N hold the function's
+parameters that the entry function copies in").
+
+Use `transform_to_state_machine_with_options` with a non-zero
+`reserved_slots` to shift krio's allocator past the host's range:
+
+```rust
+let layout = transform_to_state_machine_with_options(
+    &mut cfg, fn_id, &suspending, &hooks, &liveness,
+    TransformOptions { reserved_slots: 1 + num_params },
+)?;
+// Slots 0..=num_params are the host's. krio's captures-lift uses
+// slots [num_params+1 ..]. The two ranges are guaranteed disjoint.
+```
+
+## Layout validation (`validate_layout`)
+
+`validate_layout(&layout, next_slot)` audits a returned
+`StateMachineLayout` for internal consistency. Run it in debug
+builds — it catches host-side bugs that would otherwise show up as
+mysterious codegen failures:
+
+- A slot saved at a yield with no matching load (host's liveness
+  over-reports → wasted save).
+- A slot loaded at a resume with no matching save (host's liveness
+  under-reports → resume reads garbage).
+- Duplicate slot indices in one block's save or load list.
+- Resume entry / yield block count drift.
+- Slot indices outside the expected range.
+
+Returns `Ok(())` on a clean layout, or a structured `LayoutError`
+identifying the first inconsistency.
+
+## Host gotchas
+
+A few things krio-async **does not** do for you, but that come up
+in real ports:
+
+1. **Phi node defs in liveness.** If your IR has phi-shaped block
+   parameters (loop counters, accumulators), include their result
+   IDs in your "defined-before-suspension" set when computing
+   liveness. krio doesn't model phis — it only sees the values you
+   declare live.
+
+2. **Phi `incoming` repair after splits.** When krio splits a
+   block at a suspension, the post-split tail block becomes a new
+   predecessor of any phi-block the original block branched to.
+   Your host's IR likely needs a small repair pass that walks
+   phi.incoming entries, drops dead predecessors (the original
+   block no longer branches to the phi), and adds the new ones.
+   See zyntax's `krio_adapter::abi_emit::repair_phi_predecessors`
+   for a reference implementation (~50 LOC).
+
+3. **Host owns runtime-ABI slots.** krio doesn't know about your
+   state-id field, your parameter slots, or your scratch space —
+   use `TransformOptions::reserved_slots` to keep them disjoint
+   from krio's captures-lift slots.
+
 ## Reference
 
 `/Users/amaterasu/Vibranium/wren_lift/src/codegen/aot_state_machine.rs`
@@ -127,3 +192,9 @@ drive it.
 all of wren_lift's v1 caps: live-across-suspension values, mid-
 block direct yields, multiple suspensions per source block, and
 cross-function dispatch all work.
+
+`/Users/amaterasu/Vibranium/zyntax/crates/passes/krio_adapter/`
+— zyntax's port of krio-async to its HIR. Demonstrates the host
+gotchas above: liveness with phi defs (`HirLiveness::build`), phi
+predecessor repair (`repair_phi_predecessors`), and slot
+reservation for runtime ABI (`TransformOptions::reserved_slots`).
