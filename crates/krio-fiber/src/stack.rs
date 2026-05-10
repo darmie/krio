@@ -95,7 +95,10 @@ unsafe fn mmap_stack(requested_size: usize) -> Stack {
     // The guard page is the *bottom* page. The fiber's stack grows
     // downward from the top; an overflow trips through the guard.
     let rc = unsafe { mprotect(base, page_size, PROT_NONE) };
-    assert!(rc == 0, "krio-fiber: mprotect(PROT_NONE) failed on guard page");
+    assert!(
+        rc == 0,
+        "krio-fiber: mprotect(PROT_NONE) failed on guard page"
+    );
 
     // Usable region starts above the guard.
     let usable_start = unsafe { (base as *mut u8).add(page_size) };

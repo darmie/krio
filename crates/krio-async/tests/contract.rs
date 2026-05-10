@@ -205,8 +205,14 @@ fn non_suspending_fn_returns_trivial_layout() {
     };
     let hooks = ToyHooks;
 
-    let layout = transform_to_state_machine(&mut cfg, ToyFnId(42), &suspending, &hooks, &LivenessMap::new())
-        .expect("non-suspending fn should produce a trivial Ok layout");
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(42),
+        &suspending,
+        &hooks,
+        &LivenessMap::new(),
+    )
+    .expect("non-suspending fn should produce a trivial Ok layout");
     assert!(layout.resume_entries.is_empty());
     assert!(layout.yield_blocks.is_empty());
     assert!(layout.block_kinds.is_empty());
@@ -225,8 +231,14 @@ fn no_yields_in_suspending_fn_just_records_entry() {
         suspending: HashSet::from([ToyFnId(1)]),
         yields: HashSet::new(),
     };
-    let layout =
-        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks, &LivenessMap::new()).unwrap();
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &ToyHooks,
+        &LivenessMap::new(),
+    )
+    .unwrap();
     assert_eq!(layout.resume_entries.len(), 1, "state 0 = entry");
     assert!(layout.yield_blocks.is_empty());
     assert!(layout.block_kinds.is_empty());
@@ -242,14 +254,23 @@ fn single_yield_at_block_tail_splits_correctly() {
         suspending: HashSet::from([ToyFnId(1)]),
         yields: HashSet::new(),
     };
-    let layout =
-        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks, &LivenessMap::new()).unwrap();
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &ToyHooks,
+        &LivenessMap::new(),
+    )
+    .unwrap();
 
     // resume_entries[0] = original entry, resume_entries[1] = block
     // created by splitting after the yield (initially empty).
     assert_eq!(layout.resume_entries.len(), 2);
     assert_eq!(layout.yield_blocks.len(), 1);
-    assert_eq!(layout.yield_blocks[0].1, 1, "next state after first yield = 1");
+    assert_eq!(
+        layout.yield_blocks[0].1, 1,
+        "next state after first yield = 1"
+    );
 
     // Yield block kept the User + Yield; resume entry got the (empty) tail.
     assert_eq!(cfg.statement_count(layout.yield_blocks[0].0), 2);
@@ -276,9 +297,14 @@ fn yield_mid_block_splits_post_yield_tail_into_resume() {
         suspending: HashSet::from([ToyFnId(1)]),
         yields: HashSet::new(),
     };
-    let layout =
-        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks, &LivenessMap::new())
-            .expect("v3 handles mid-block direct yield");
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &ToyHooks,
+        &LivenessMap::new(),
+    )
+    .expect("v3 handles mid-block direct yield");
 
     // resume_entries[0] = bb0 (entry); resume_entries[1] = the
     // tail block created by splitting after the yield.
@@ -441,14 +467,8 @@ fn cross_fn_with_liveness_loads_at_resume_check() {
     let mut liveness = LivenessMap::new();
     liveness.record(bb0, 1, vec![ToyValueId(5)]);
 
-    let layout = transform_to_state_machine(
-        &mut cfg,
-        ToyFnId(1),
-        &suspending,
-        &hooks,
-        &liveness,
-    )
-    .unwrap();
+    let layout =
+        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &hooks, &liveness).unwrap();
 
     let resume_check = layout.resume_entries[1];
     assert_eq!(layout.yield_saves.len(), 1);
@@ -504,8 +524,14 @@ fn multiple_yields_each_get_own_state() {
         suspending: HashSet::from([ToyFnId(1)]),
         yields: HashSet::new(),
     };
-    let layout =
-        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks, &LivenessMap::new()).unwrap();
+    let layout = transform_to_state_machine(
+        &mut cfg,
+        ToyFnId(1),
+        &suspending,
+        &ToyHooks,
+        &LivenessMap::new(),
+    )
+    .unwrap();
 
     assert_eq!(layout.resume_entries.len(), 3);
     assert_eq!(layout.yield_blocks.len(), 2);
@@ -541,14 +567,9 @@ fn liveness_drives_save_load_tables() {
         vec![ToyValueId(7), ToyValueId(11)],
     );
 
-    let layout = transform_to_state_machine(
-        &mut cfg,
-        ToyFnId(1),
-        &suspending,
-        &ToyHooks,
-        &liveness,
-    )
-    .unwrap();
+    let layout =
+        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks, &liveness)
+            .unwrap();
 
     assert_eq!(layout.yield_saves.len(), 1);
     let (save_block, saves) = &layout.yield_saves[0];
@@ -611,14 +632,9 @@ fn shared_value_across_yields_reuses_slot() {
     liveness.record(ToyBlockId(0), 1, vec![ToyValueId(42)]);
     liveness.record(ToyBlockId(1), 1, vec![ToyValueId(42)]);
 
-    let layout = transform_to_state_machine(
-        &mut cfg,
-        ToyFnId(1),
-        &suspending,
-        &ToyHooks,
-        &liveness,
-    )
-    .unwrap();
+    let layout =
+        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks, &liveness)
+            .unwrap();
 
     assert_eq!(layout.yield_saves.len(), 2);
     // Both saves use slot 0 because the same value is live at both.
@@ -642,14 +658,9 @@ fn distinct_values_get_distinct_slots() {
     liveness.record(ToyBlockId(0), 1, vec![ToyValueId(1)]);
     liveness.record(ToyBlockId(1), 1, vec![ToyValueId(2)]);
 
-    let layout = transform_to_state_machine(
-        &mut cfg,
-        ToyFnId(1),
-        &suspending,
-        &ToyHooks,
-        &liveness,
-    )
-    .unwrap();
+    let layout =
+        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks, &liveness)
+            .unwrap();
 
     assert_eq!(layout.yield_saves[0].1[0], (0, ToyValueId(1)));
     assert_eq!(layout.yield_saves[1].1[0], (1, ToyValueId(2)));
@@ -798,7 +809,9 @@ fn cross_fn_then_direct_yield_in_same_block() {
     // and the direct yield to post_call (state 2). post_call is the
     // CrossFnCallResume's done_block.
     let init_done_block = match &layout.block_kinds[0].1 {
-        BlockKind::CrossFnCallInit { resume_check_block, .. } => *resume_check_block,
+        BlockKind::CrossFnCallInit {
+            resume_check_block, ..
+        } => *resume_check_block,
         _ => panic!("expected Init at index 0"),
     };
     assert_eq!(init_done_block, resume_check);
@@ -881,7 +894,12 @@ fn direct_yield_then_cross_fn_in_same_block() {
     // Second entry: tail_y → CrossFnCallInit. Pull resume_check_block
     // out and confirm it matches resume_entries[2].
     match &layout.block_kinds[1] {
-        (b, BlockKind::CrossFnCallInit { resume_check_block, .. }) => {
+        (
+            b,
+            BlockKind::CrossFnCallInit {
+                resume_check_block, ..
+            },
+        ) => {
             assert_eq!(*b, tail_y);
             assert_eq!(*resume_check_block, resume_check);
         }
@@ -968,13 +986,25 @@ fn two_cross_fn_calls_in_same_block_each_get_their_own_resume_check() {
 
     // Init1 at bb0, points at resume_check_1.
     let post_call_1 = match &layout.block_kinds[0] {
-        (b, BlockKind::CrossFnCallInit { resume_check_block, callee, .. }) => {
+        (
+            b,
+            BlockKind::CrossFnCallInit {
+                resume_check_block,
+                callee,
+                ..
+            },
+        ) => {
             assert_eq!(*b, bb0);
             assert_eq!(*resume_check_block, resume_check_1);
             assert_eq!(*callee, ToyFnId(7));
             // Resume1 carries the matching done_block.
             match &layout.block_kinds[1] {
-                (rb, BlockKind::CrossFnCallResume { done_block, callee, .. }) => {
+                (
+                    rb,
+                    BlockKind::CrossFnCallResume {
+                        done_block, callee, ..
+                    },
+                ) => {
                     assert_eq!(*rb, resume_check_1);
                     assert_eq!(*callee, ToyFnId(7));
                     *done_block
@@ -987,7 +1017,14 @@ fn two_cross_fn_calls_in_same_block_each_get_their_own_resume_check() {
 
     // Init2 sits on post_call_1.
     match &layout.block_kinds[2] {
-        (b, BlockKind::CrossFnCallInit { resume_check_block, callee, .. }) => {
+        (
+            b,
+            BlockKind::CrossFnCallInit {
+                resume_check_block,
+                callee,
+                ..
+            },
+        ) => {
             assert_eq!(*b, post_call_1);
             assert_eq!(*resume_check_block, resume_check_2);
             assert_eq!(*callee, ToyFnId(8));
@@ -995,7 +1032,12 @@ fn two_cross_fn_calls_in_same_block_each_get_their_own_resume_check() {
         other => panic!("expected Init2 at post_call_1, got {other:?}"),
     }
     let post_call_2 = match &layout.block_kinds[3] {
-        (b, BlockKind::CrossFnCallResume { done_block, callee, .. }) => {
+        (
+            b,
+            BlockKind::CrossFnCallResume {
+                done_block, callee, ..
+            },
+        ) => {
             assert_eq!(*b, resume_check_2);
             assert_eq!(*callee, ToyFnId(8));
             *done_block
@@ -1040,14 +1082,9 @@ fn multi_suspension_with_liveness_uses_correct_yield_and_resume_blocks() {
     liveness.record(bb0, 1, vec![ToyValueId(10)]);
     liveness.record(bb0, 3, vec![ToyValueId(20)]);
 
-    let layout = transform_to_state_machine(
-        &mut cfg,
-        ToyFnId(1),
-        &suspending,
-        &ToyHooks,
-        &liveness,
-    )
-    .unwrap();
+    let layout =
+        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks, &liveness)
+            .unwrap();
 
     let tail_a = layout.resume_entries[1];
     let tail_b = layout.resume_entries[2];
@@ -1111,7 +1148,7 @@ fn multi_suspension_across_blocks_keeps_per_block_state() {
 fn reserved_slots_offset_captures_lift_allocator() {
     // Host reserves slots 0..3 for runtime-ABI bookkeeping. krio
     // must allocate captures-lift slots starting at 3, not 0.
-    use krio_async::{transform_to_state_machine_with_options, TransformOptions};
+    use krio_async::{TransformOptions, transform_to_state_machine_with_options};
 
     let mut cfg = ToyCfg::new();
     cfg.push_block(vec![ToyStmt::User("compute"), ToyStmt::Yield]);
@@ -1122,11 +1159,7 @@ fn reserved_slots_offset_captures_lift_allocator() {
     };
 
     let mut liveness = LivenessMap::new();
-    liveness.record(
-        ToyBlockId(0),
-        1,
-        vec![ToyValueId(7), ToyValueId(11)],
-    );
+    liveness.record(ToyBlockId(0), 1, vec![ToyValueId(7), ToyValueId(11)]);
 
     let layout = transform_to_state_machine_with_options(
         &mut cfg,
@@ -1139,8 +1172,16 @@ fn reserved_slots_offset_captures_lift_allocator() {
     .unwrap();
 
     let saves = &layout.yield_saves[0].1;
-    assert_eq!(saves[0], (3, ToyValueId(7)),  "first capture slot starts at reserved_slots, not 0");
-    assert_eq!(saves[1], (4, ToyValueId(11)), "second capture slot is reserved_slots + 1");
+    assert_eq!(
+        saves[0],
+        (3, ToyValueId(7)),
+        "first capture slot starts at reserved_slots, not 0"
+    );
+    assert_eq!(
+        saves[1],
+        (4, ToyValueId(11)),
+        "second capture slot is reserved_slots + 1"
+    );
 
     let loads = &layout.resume_loads[0].1;
     assert_eq!(loads[0], (3, ToyValueId(7)));
@@ -1161,16 +1202,10 @@ fn validate_layout_accepts_clean_output_from_transform() {
     let mut liveness = LivenessMap::new();
     liveness.record(ToyBlockId(0), 1, vec![ToyValueId(42)]);
 
-    let layout = transform_to_state_machine(
-        &mut cfg,
-        ToyFnId(1),
-        &suspending,
-        &ToyHooks,
-        &liveness,
-    )
-    .unwrap();
+    let layout =
+        transform_to_state_machine(&mut cfg, ToyFnId(1), &suspending, &ToyHooks, &liveness)
+            .unwrap();
 
     // Layout produced by krio should always be self-consistent.
     validate_layout(&layout, /* next_slot = */ 1).expect("transform output must validate");
 }
-

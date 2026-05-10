@@ -69,7 +69,12 @@ fn yield_works_from_nested_call() {
     assert_eq!(fiber.resume(), FiberStep::Done);
     assert_eq!(
         *log.borrow(),
-        vec!["before helper", "entered helper", "exited helper", "after helper"]
+        vec![
+            "before helper",
+            "entered helper",
+            "exited helper",
+            "after helper"
+        ]
     );
 }
 

@@ -93,12 +93,7 @@ pub trait CoroCfg {
     /// Insert `(stmt_local = const_i64(value))` at the FRONT of
     /// `bb`'s statement list. Used by the cooperative executor when
     /// initialising state locals before entering the loop.
-    fn prepend_assign_i64(
-        &mut self,
-        bb: Self::BlockId,
-        local: Self::LocalId,
-        value: i64,
-    );
+    fn prepend_assign_i64(&mut self, bb: Self::BlockId, local: Self::LocalId, value: i64);
 
     // ── Terminator manipulation ────────────────────────────────────
 
@@ -127,12 +122,7 @@ pub trait CoroCfg {
     /// Within `bb`'s terminator, rewrite every reference to `from`
     /// so it points to `to`. Touches every shape (goto / branch /
     /// switch / call etc.) the consumer's IR supports.
-    fn redirect_targets(
-        &mut self,
-        bb: Self::BlockId,
-        from: Self::BlockId,
-        to: Self::BlockId,
-    );
+    fn redirect_targets(&mut self, bb: Self::BlockId, from: Self::BlockId, to: Self::BlockId);
 }
 
 /// Consumer-side hooks the abstract algorithm can't perform on its

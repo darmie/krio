@@ -140,13 +140,7 @@ impl CoroCfg for ToyBody {
             .push(ToyStmt::AssignBool(local, value));
     }
 
-    fn emit_eq_check_i64(
-        &mut self,
-        bb: ToyBlockId,
-        dest: ToyLocalId,
-        lhs: ToyLocalId,
-        rhs: i64,
-    ) {
+    fn emit_eq_check_i64(&mut self, bb: ToyBlockId, dest: ToyLocalId, lhs: ToyLocalId, rhs: i64) {
         self.blocks[bb.0 as usize]
             .0
             .push(ToyStmt::EqCheckI64 { dest, lhs, rhs });
@@ -203,12 +197,7 @@ impl CoroCfg for ToyBody {
         };
     }
 
-    fn redirect_targets(
-        &mut self,
-        bb: ToyBlockId,
-        from: ToyBlockId,
-        to: ToyBlockId,
-    ) {
+    fn redirect_targets(&mut self, bb: ToyBlockId, from: ToyBlockId, to: ToyBlockId) {
         let term = &mut self.blocks[bb.0 as usize].1;
         match term {
             ToyTerm::Goto(t) if *t == from => *t = to,
@@ -244,12 +233,7 @@ struct ToyHooks;
 impl CoroHooks for ToyHooks {
     type Cfg = ToyBody;
 
-    fn classify_marker(
-        &self,
-        cfg: &ToyBody,
-        bb: ToyBlockId,
-        idx: usize,
-    ) -> Option<Marker> {
+    fn classify_marker(&self, cfg: &ToyBody, bb: ToyBlockId, idx: usize) -> Option<Marker> {
         match &cfg.blocks[bb.0 as usize].0[idx] {
             ToyStmt::Marker(m) => Some(*m),
             _ => None,
@@ -307,10 +291,7 @@ fn build_simple_region() -> ToyBody {
         ToyTerm::Goto(bb_c1_yield),
     );
     body.blocks[bb_c1_yield.0 as usize] = (
-        vec![
-            ToyStmt::User("c1.s1"),
-            ToyStmt::Marker(Marker::Yield),
-        ],
+        vec![ToyStmt::User("c1.s1"), ToyStmt::Marker(Marker::Yield)],
         ToyTerm::Goto(bb_c1_end),
     );
     body.blocks[bb_c1_end.0 as usize] = (
@@ -335,10 +316,7 @@ fn build_simple_region() -> ToyBody {
         vec![ToyStmt::Marker(Marker::RegionEnd)],
         ToyTerm::Goto(bb_post),
     );
-    body.blocks[bb_post.0 as usize] = (
-        vec![ToyStmt::User("post-region")],
-        ToyTerm::Return,
-    );
+    body.blocks[bb_post.0 as usize] = (vec![ToyStmt::User("post-region")], ToyTerm::Return);
     body
 }
 
@@ -512,7 +490,9 @@ fn waker_executor_done_path_reaches_post_region() {
         hops += 1;
         assert!(hops < 10, "too many hops chasing done's goto");
         let (stmts, term) = &body.blocks[current.0 as usize];
-        let has_post = stmts.iter().any(|s| matches!(s, ToyStmt::User(name) if *name == "post-region"));
+        let has_post = stmts
+            .iter()
+            .any(|s| matches!(s, ToyStmt::User(name) if *name == "post-region"));
         if has_post {
             break true;
         }

@@ -82,7 +82,7 @@ pub use krio_core::{CfgId, Marker, Suspension};
 pub use krio_stackless::CoroCfg;
 
 pub mod validate;
-pub use validate::{validate_layout, LayoutError};
+pub use validate::{LayoutError, validate_layout};
 
 /// Process-unique IDs the host uses to refer to functions / methods
 /// in its program. Treated as opaque handles by krio-async.
@@ -605,10 +605,8 @@ where
     // pairs. Slot allocation is global per function: a value live
     // at multiple suspensions reuses its slot.
     use alloc::collections::BTreeMap;
-    let mut value_to_slot: BTreeMap<
-        <H::Cfg as krio_stackless::CoroCfg>::LocalId,
-        u32,
-    > = BTreeMap::new();
+    let mut value_to_slot: BTreeMap<<H::Cfg as krio_stackless::CoroCfg>::LocalId, u32> =
+        BTreeMap::new();
     // Captures-lift slot allocator starts at `reserved_slots` so the
     // host can pre-claim `0..reserved_slots` for runtime-ABI uses
     // (state-id, params, etc.) without colliding with krio's slots.

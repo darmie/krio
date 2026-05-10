@@ -654,10 +654,7 @@ extern "C" fn fiber_run(state_ptr: *mut TrampolineState) -> ! {
     unsafe {
         *state.done_flag = true;
         loop {
-            krio_fiber_switch(
-                state.fiber_sp_slot,
-                state.caller_sp_slot as *const *mut u8,
-            );
+            krio_fiber_switch(state.fiber_sp_slot, state.caller_sp_slot as *const *mut u8);
             // If somehow control returns here (consumer re-resumed
             // a Done fiber via the asm directly), keep yielding.
         }

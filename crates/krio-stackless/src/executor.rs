@@ -109,11 +109,7 @@ fn build_cooperative_loop<C: CoroCfg>(
     let mut current_bb = loop_bb;
 
     for (i, machine) in machines.iter().enumerate() {
-        let check_bb = if i == 0 {
-            current_bb
-        } else {
-            cfg.new_block()
-        };
+        let check_bb = if i == 0 { current_bb } else { cfg.new_block() };
         if i > 0 {
             cfg.set_goto(current_bb, check_bb);
         }
@@ -194,15 +190,9 @@ fn build_cooperative_loop<C: CoroCfg>(
 
     // If coroutine 0's body started in the same block, retarget the
     // first machine's dispatch state-0 arm.
-    if let (Some(first_machine), Some(first_coro)) =
-        (machines.first(), region.coroutines.first())
-    {
+    if let (Some(first_machine), Some(first_coro)) = (machines.first(), region.coroutines.first()) {
         if first_coro.begin.0 == region_begin_bb {
-            cfg.redirect_targets(
-                first_machine.dispatch_bb,
-                first_coro.begin.0,
-                new_entry,
-            );
+            cfg.redirect_targets(first_machine.dispatch_bb, first_coro.begin.0, new_entry);
         }
     }
 
@@ -326,11 +316,7 @@ fn build_oneshot_poll<C: CoroCfg>(
     let mut current_bb = poll_top_bb;
 
     for (i, machine) in machines.iter().enumerate() {
-        let check_bb = if i == 0 {
-            current_bb
-        } else {
-            cfg.new_block()
-        };
+        let check_bb = if i == 0 { current_bb } else { cfg.new_block() };
         if i > 0 {
             cfg.set_goto(current_bb, check_bb);
         }
@@ -363,7 +349,12 @@ fn build_oneshot_poll<C: CoroCfg>(
 
     // Final fork: all_done -> region_done; otherwise -> region_pending.
     // No loop-back, unlike CooperativeExecutor.
-    cfg.set_branch(current_bb, all_done_local, region_done_bb, region_pending_bb);
+    cfg.set_branch(
+        current_bb,
+        all_done_local,
+        region_done_bb,
+        region_pending_bb,
+    );
 
     // Erase markers + lift the first coroutine's body — same dance
     // as the cooperative path.
@@ -378,8 +369,7 @@ fn build_oneshot_poll<C: CoroCfg>(
     let split_idx = region.region_begin.1;
     let new_entry = cfg.split_after(region_begin_bb, split_idx);
 
-    if let (Some(first_machine), Some(first_coro)) =
-        (machines.first(), region.coroutines.first())
+    if let (Some(first_machine), Some(first_coro)) = (machines.first(), region.coroutines.first())
         && first_coro.begin.0 == region_begin_bb
     {
         cfg.redirect_targets(first_machine.dispatch_bb, first_coro.begin.0, new_entry);
