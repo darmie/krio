@@ -562,5 +562,8 @@ fn saved_fp_chain_terminates_cleanly() {
         fp = next_fp;
     }
     assert!(walked > 0, "walker must traverse at least one frame");
-    assert!(walked < max_frames, "walker must terminate (max_frames hit)");
+    assert!(
+        walked < max_frames,
+        "walker must terminate (max_frames hit)"
+    );
 }
