@@ -484,3 +484,83 @@ fn take_yield_any_returns_opaque_box() {
     // After take_yield_any the slot is empty.
     assert!(!fiber.has_yield_value());
 }
+
+// ── GC introspection: saved frame-pointer + return address ──────────
+
+#[test]
+fn saved_fp_is_none_for_new_and_done_fibers() {
+    let fiber = Fiber::new(|| {});
+    assert_eq!(fiber.state(), FiberState::New);
+    assert!(fiber.saved_fp().is_none());
+    assert!(fiber.saved_ret().is_none());
+
+    let mut fiber = Fiber::new(|| {});
+    fiber.resume();
+    assert_eq!(fiber.state(), FiberState::Done);
+    assert!(fiber.saved_fp().is_none());
+    assert!(fiber.saved_ret().is_none());
+}
+
+#[test]
+fn saved_fp_points_into_fiber_stack_when_suspended() {
+    let mut fiber = Fiber::new(|| {
+        yield_now();
+    });
+    fiber.resume();
+    assert_eq!(fiber.state(), FiberState::Suspended);
+
+    let saved_fp = fiber.saved_fp().expect("suspended fiber has saved fp");
+    let saved_ret = fiber.saved_ret().expect("suspended fiber has saved ret");
+
+    // saved_fp should be a plausible heap pointer, NOT null, NOT
+    // word-misaligned (frame pointers must be 8-byte-aligned).
+    assert!(!saved_fp.is_null(), "saved_fp must not be null");
+    assert_eq!(
+        (saved_fp as usize) & 7,
+        0,
+        "saved_fp must be 8-byte aligned"
+    );
+    // saved_ret points into executable code (the trampoline /
+    // yield_now's caller). Sanity: it's not null and not zero.
+    assert!(!saved_ret.is_null(), "saved_ret must not be null");
+}
+
+#[test]
+fn saved_fp_chain_terminates_cleanly() {
+    // Walk the frame chain from the fiber's saved_fp and verify
+    // every step decreases (frames grow downward) or hits null.
+    // This is the exact pattern a GC walker uses to traverse a
+    // suspended fiber's stack.
+    let mut fiber = Fiber::new(|| {
+        yield_now();
+    });
+    fiber.resume();
+
+    let mut fp = fiber.saved_fp().expect("suspended fiber") as usize;
+    let mut walked = 0;
+    let max_frames = 64;
+    while fp != 0 && walked < max_frames {
+        walked += 1;
+        // Frame chain invariant: aligned word.
+        assert_eq!(fp & 7, 0, "frame pointer must be 8-byte aligned");
+        // Read the saved fp at *fp (first word of the frame).
+        let next_fp = unsafe { *(fp as *const usize) };
+        // Either we've reached a sentinel (0 / null) marking the
+        // top of the fiber's stack, or the chain continues with
+        // a higher address (stack grows downward, so caller's fp
+        // is higher than callee's).
+        if next_fp == 0 {
+            break;
+        }
+        // The next fp should be at a higher address (older frame).
+        // If it's lower, the chain is corrupt — likely we've walked
+        // off the end of the fiber's stack into garbage.
+        assert!(
+            next_fp > fp,
+            "frame chain went backwards: next_fp={next_fp:#x} < fp={fp:#x} at step {walked}"
+        );
+        fp = next_fp;
+    }
+    assert!(walked > 0, "walker must traverse at least one frame");
+    assert!(walked < max_frames, "walker must terminate (max_frames hit)");
+}

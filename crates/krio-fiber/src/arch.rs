@@ -99,3 +99,25 @@ pub const SAVED_FRAME_BYTES: usize = 6 * 8; // rbp, rbx, r12, r13, r14, r15
 
 #[cfg(target_arch = "aarch64")]
 pub const SAVED_FRAME_BYTES: usize = 112; // 12 callee-saved regs + alignment slot
+
+/// Byte offset, from a suspended fiber's [`super::Fiber::saved_sp`],
+/// of the saved frame-pointer register (`rbp` on x86_64, `x29` on
+/// aarch64). The suspended fiber's stack frame chain starts at
+/// `*(saved_sp + SAVED_FP_OFFSET)`. Used by host GCs to walk the
+/// fiber's frames when scanning roots across a suspension.
+#[cfg(target_arch = "x86_64")]
+pub const SAVED_FP_OFFSET: usize = 40; // r15,r14,r13,r12,rbx then rbp at +40
+
+#[cfg(target_arch = "aarch64")]
+pub const SAVED_FP_OFFSET: usize = 80; // x29 lives at sp+80 (see stp pair)
+
+/// Byte offset of the saved return address (instruction at which the
+/// fiber will resume execution after the next context switch). On
+/// x86_64 this is the implicit return address pushed by the `call`
+/// to `krio_fiber_switch` and sits just above the saved registers.
+/// On aarch64 this is `x30`, saved alongside `x29` in the stp pair.
+#[cfg(target_arch = "x86_64")]
+pub const SAVED_RET_OFFSET: usize = 48; // ret_addr sits above the 6 saved regs
+
+#[cfg(target_arch = "aarch64")]
+pub const SAVED_RET_OFFSET: usize = 88; // x30 lives at sp+88 (companion of x29)

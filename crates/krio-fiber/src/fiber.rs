@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use krio_core::{Suspension, Task};
 
-use crate::arch::{SAVED_FRAME_BYTES, krio_fiber_switch};
+use crate::arch::{SAVED_FP_OFFSET, SAVED_FRAME_BYTES, SAVED_RET_OFFSET, krio_fiber_switch};
 use crate::stack::Stack;
 
 /// Lifecycle state of a fiber.
@@ -339,6 +339,73 @@ impl Fiber {
     /// Attach (or replace) a debugging label.
     pub fn set_name<N: Into<String>>(&mut self, name: N) {
         self.name = Some(name.into());
+    }
+
+    /// Saved stack pointer for a suspended fiber. Points at the top
+    /// of the saved-callee-registers region produced by
+    /// [`crate::arch::krio_fiber_switch`].
+    ///
+    /// Only meaningful while the fiber is in [`FiberState::Suspended`] —
+    /// for a `New` fiber this points at a synthetic startup frame; for
+    /// `Done` / `Errored` fibers the stack is logically dead. Hosts
+    /// that need to scan fiber stacks (e.g. for GC root tracing) should
+    /// check [`Fiber::state`] first.
+    ///
+    /// Returns `null` if the fiber's stack hasn't been initialised yet
+    /// (cannot happen in practice — Fiber construction always runs
+    /// `prepare_initial_stack`).
+    pub fn saved_sp(&self) -> *const u8 {
+        self.fiber_sp
+    }
+
+    /// Read the saved frame-pointer register (`rbp` on x86_64, `x29`
+    /// on aarch64) from a suspended fiber's saved-registers region.
+    /// This is the entry point a frame-chain walker uses to traverse
+    /// the fiber's stack frames — `saved_fp` points at the fiber's
+    /// deepest active frame; each frame's first word is its own
+    /// caller's saved fp, forming the standard SysV/AAPCS64 chain.
+    ///
+    /// Returns `None` if the fiber is in [`FiberState::New`] (no
+    /// meaningful saved state yet — the synthetic startup frame
+    /// contains zeros) or has terminated.
+    ///
+    /// # Safety
+    /// Always safe to call. The returned pointer is into the fiber's
+    /// owned stack and is valid for as long as the `Fiber` lives. The
+    /// caller is responsible for any unsafety in dereferencing it
+    /// (e.g. interpreting stack contents for GC root scanning).
+    pub fn saved_fp(&self) -> Option<*const u8> {
+        if !matches!(self.state(), FiberState::Suspended) {
+            return None;
+        }
+        // SAFETY: A suspended fiber's `fiber_sp` was written by
+        // `krio_fiber_switch`'s save path, which always pushes
+        // `SAVED_FRAME_BYTES` of register state. The saved fp slot
+        // is at a fixed offset within that region.
+        let fp = unsafe { *(self.fiber_sp.add(SAVED_FP_OFFSET) as *const *const u8) };
+        Some(fp)
+    }
+
+    /// Read the saved return address from a suspended fiber — the
+    /// instruction the fiber will resume executing on the next
+    /// `resume()`. On x86_64 this is the implicit return address
+    /// pushed by the call into `krio_fiber_switch`; on aarch64 it's
+    /// the saved `x30` (link register).
+    ///
+    /// Useful for GCs that need to find the active safepoint for a
+    /// suspended fiber's deepest frame (look up `saved_ret` against
+    /// the host's registered code-range table to find which compiled
+    /// function it falls in, then index into that function's
+    /// safepoint metadata).
+    ///
+    /// Returns `None` if the fiber isn't suspended (see
+    /// [`Fiber::saved_fp`] for the same semantics).
+    pub fn saved_ret(&self) -> Option<*const u8> {
+        if !matches!(self.state(), FiberState::Suspended) {
+            return None;
+        }
+        let ret = unsafe { *(self.fiber_sp.add(SAVED_RET_OFFSET) as *const *const u8) };
+        Some(ret)
     }
 
     /// Continue running the fiber until it yields or terminates.
