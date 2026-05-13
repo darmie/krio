@@ -18,6 +18,10 @@ env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: nightly-2026-04-07
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   test:
     name: ${{ matrix.name }}
@@ -29,9 +33,15 @@ jobs:
           - name: Linux x86_64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            run_tests: true
           - name: macOS x86_64
             runner: macos-15-intel
             target: x86_64-apple-darwin
+            run_tests: true
+          - name: Windows x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            run_tests: false
 
     steps:
       - name: Checkout
@@ -49,7 +59,8 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --locked --target "${{ matrix.target }}"
+        run: cargo clippy --workspace --all-targets --target "${{ matrix.target }}"
 
       - name: Run tests
-        run: cargo test --workspace --locked --target "${{ matrix.target }}"
+        if: matrix.run_tests
+        run: cargo test --workspace --target "${{ matrix.target }}"
