@@ -619,7 +619,7 @@ unsafe fn prepare_initial_stack(stack: &mut [u8], state: *mut TrampolineState) -
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(windows)))]
 unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) -> *mut u8 {
     // The switch's `pop %r15..%rbp; ret` sequence wants the stack
     // (low to high) to look like:
@@ -657,6 +657,30 @@ unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) 
     sp
 }
 
+#[cfg(all(target_arch = "x86_64", windows))]
+unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) -> *mut u8 {
+    // MS x64 saved-frame layout (low → high addresses):
+    //   sp+0   .. sp+144 : xmm6..xmm15 (10 × 16 bytes = 160)
+    //   sp+160 .. sp+216 : r15, r14, r13, r12, rsi, rdi, rbx, rbp
+    //   sp+224           : trampoline_addr (the saved return addr)
+    // Total: 232 bytes from sp to (top-of-frame).
+    //
+    // `state` is stashed in the r12 slot (sp+184) — the MS x64
+    // callee-saved set includes r12, so the trampoline observes it
+    // on first entry.
+    let sp = unsafe { top.sub(SAVED_FRAME_BYTES + 8) };
+    unsafe {
+        // Zero the whole 224-byte saved-register region (xmm + GP).
+        core::ptr::write_bytes(sp, 0, SAVED_FRAME_BYTES);
+        // Overwrite the r12 slot with the trampoline state pointer.
+        (sp.add(184) as *mut usize).write(state as usize);
+        // ret_addr slot (sp + SAVED_RET_OFFSET) gets the trampoline.
+        (sp.add(SAVED_RET_OFFSET) as *mut usize)
+            .write(fiber_trampoline_x86_64 as *const () as usize);
+    }
+    sp
+}
+
 #[cfg(target_arch = "aarch64")]
 unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) -> *mut u8 {
     // The switch's restore sequence wants the stack (low to high) to
@@ -681,13 +705,32 @@ unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) 
 
 // ── Trampolines ───────────────────────────────────────────────────
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(windows)))]
 #[unsafe(naked)]
 unsafe extern "C" fn fiber_trampoline_x86_64() {
     // r12 holds the TrampolineState pointer (stashed in
     // prepare_initial_stack_arch). Move it into rdi and tail-call
     // `fiber_run`.
     core::arch::naked_asm!("mov %r12, %rdi", "call {f}", "ud2",
+        f = sym fiber_run,
+        options(att_syntax),
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", windows))]
+#[unsafe(naked)]
+unsafe extern "C" fn fiber_trampoline_x86_64() {
+    // MS x64: first arg goes in rcx, and the caller must reserve
+    // 32 bytes of shadow space below the call. `sub $32, %rsp`
+    // keeps rsp 16-aligned (the `ret` that entered this function
+    // left rsp 16-aligned) so the subsequent `call` pushes 8 bytes
+    // for the return address and `fiber_run` sees the ABI-required
+    // rsp % 16 == 8 on entry.
+    core::arch::naked_asm!(
+        "mov %r12, %rcx",
+        "sub $32, %rsp",
+        "call {f}",
+        "ud2",
         f = sym fiber_run,
         options(att_syntax),
     )
