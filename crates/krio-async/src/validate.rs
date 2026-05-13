@@ -40,8 +40,6 @@
 //! section but can't be checked from the layout alone.
 
 use alloc::collections::BTreeMap;
-use alloc::format;
-use alloc::vec::Vec;
 use core::fmt;
 
 use krio_core::CfgId;

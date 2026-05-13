@@ -11,6 +11,10 @@
 //!
 //! There is no execution engine — these tests assert *shape*.
 
+// The IR variants carry payload (LocalId / i64 etc.) for shape
+// documentation; tests construct them but don't read every field.
+#![allow(dead_code)]
+
 use std::collections::BTreeMap;
 
 use krio_stackless::cfg::{CoroCfg, CoroHooks, Marker};

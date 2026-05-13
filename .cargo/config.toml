@@ -1,0 +1,12 @@
+[build]
+# krio-fiber's `saved_fp` / `saved_ret` GC-introspection accessors
+# only return meaningful pointers when the build preserves frame
+# pointers. Rust on Linux defaults to omitting them (Apple toolchains
+# force them on, which is why macOS x86_64 + aarch64 work without
+# this flag). Force them workspace-wide so our own builds and tests
+# are deterministic across platforms.
+#
+# Consumers wanting to use `Fiber::saved_fp` must opt into frame
+# pointers in their own build (this config does not propagate to
+# them). See crates/krio-fiber/src/fiber.rs::Fiber::saved_fp.
+rustflags = ["-Cforce-frame-pointers=yes"]

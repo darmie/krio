@@ -161,6 +161,18 @@ pub trait AsyncHooks {
     ) -> Option<SuspensionSite<Self::FnId, <Self::Cfg as krio_stackless::CoroCfg>::LocalId>>;
 }
 
+/// `BlockId` of the host CFG behind an [`AsyncHooks`] impl.
+pub type HookBlockId<H> = <<H as AsyncHooks>::Cfg as krio_stackless::CoroCfg>::BlockId;
+/// `LocalId` of the host CFG behind an [`AsyncHooks`] impl.
+pub type HookLocalId<H> = <<H as AsyncHooks>::Cfg as krio_stackless::CoroCfg>::LocalId;
+/// `Result` type returned by the transform entry points. Folds the
+/// long associated-type projections through [`AsyncHooks`] into a
+/// single alias so the signatures stay readable.
+pub type TransformResult<H> = Result<
+    StateMachineLayout<HookBlockId<H>, HookLocalId<H>, <H as AsyncHooks>::FnId>,
+    TransformError<HookBlockId<H>>,
+>;
+
 /// What kind of suspension a block represents. The block's final
 /// terminator + any pre-Return helpers are emitted differently for
 /// each kind.
@@ -373,18 +385,8 @@ pub fn transform_to_state_machine<S, H>(
     fn_id: H::FnId,
     suspending: &S,
     hooks: &H,
-    liveness: &LivenessMap<
-        <H::Cfg as krio_stackless::CoroCfg>::BlockId,
-        <H::Cfg as krio_stackless::CoroCfg>::LocalId,
-    >,
-) -> Result<
-    StateMachineLayout<
-        <H::Cfg as krio_stackless::CoroCfg>::BlockId,
-        <H::Cfg as krio_stackless::CoroCfg>::LocalId,
-        H::FnId,
-    >,
-    TransformError<<H::Cfg as krio_stackless::CoroCfg>::BlockId>,
->
+    liveness: &LivenessMap<HookBlockId<H>, HookLocalId<H>>,
+) -> TransformResult<H>
 where
     S: SuspendingFns<FnId = H::FnId>,
     H: AsyncHooks,
@@ -438,19 +440,9 @@ pub fn transform_to_state_machine_with_options<S, H>(
     fn_id: H::FnId,
     suspending: &S,
     hooks: &H,
-    liveness: &LivenessMap<
-        <H::Cfg as krio_stackless::CoroCfg>::BlockId,
-        <H::Cfg as krio_stackless::CoroCfg>::LocalId,
-    >,
+    liveness: &LivenessMap<HookBlockId<H>, HookLocalId<H>>,
     options: TransformOptions,
-) -> Result<
-    StateMachineLayout<
-        <H::Cfg as krio_stackless::CoroCfg>::BlockId,
-        <H::Cfg as krio_stackless::CoroCfg>::LocalId,
-        H::FnId,
-    >,
-    TransformError<<H::Cfg as krio_stackless::CoroCfg>::BlockId>,
->
+) -> TransformResult<H>
 where
     S: SuspendingFns<FnId = H::FnId>,
     H: AsyncHooks,
@@ -473,12 +465,9 @@ where
 
     // Pass 1 — scan original blocks once for sites. Coordinates
     // captured here are pre-transform; downstream liveness lookups
-    // use them directly.
-    let mut sites: Vec<(
-        <H::Cfg as krio_stackless::CoroCfg>::BlockId,
-        usize,
-        SuspensionSite<H::FnId, <H::Cfg as krio_stackless::CoroCfg>::LocalId>,
-    )> = Vec::new();
+    // use them directly. Element type:
+    // `(HookBlockId<H>, usize, SuspensionSite<H::FnId, HookLocalId<H>>)`.
+    let mut sites = Vec::new();
     for &bb in &original_blocks {
         let count = cfg.statement_count(bb);
         for idx in 0..count {

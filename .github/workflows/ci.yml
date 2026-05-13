@@ -59,7 +59,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --target "${{ matrix.target }}"
+        run: cargo clippy --workspace --all-targets --target "${{ matrix.target }}" -- -D warnings
 
       - name: Run tests
         if: matrix.run_tests

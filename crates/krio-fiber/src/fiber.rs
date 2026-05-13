@@ -369,6 +369,16 @@ impl Fiber {
     /// meaningful saved state yet — the synthetic startup frame
     /// contains zeros) or has terminated.
     ///
+    /// # Build requirements
+    /// The returned pointer is only meaningful when the build
+    /// preserves frame pointers. Rust on Linux defaults to omitting
+    /// them; in that configuration `saved_fp` returns whatever the
+    /// `rbp` / `x29` register happened to hold at the suspension
+    /// point (typically `null`). Force them on workspace-wide with
+    /// `RUSTFLAGS=-Cforce-frame-pointers=yes` or via
+    /// `.cargo/config.toml`. macOS toolchains force frame pointers
+    /// by convention, so dev builds there work without the flag.
+    ///
     /// # Safety
     /// Always safe to call. The returned pointer is into the fiber's
     /// owned stack and is valid for as long as the `Fiber` lives. The

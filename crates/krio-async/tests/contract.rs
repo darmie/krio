@@ -2,6 +2,10 @@
 //! captures lift, cross-fn dispatch, and multi-suspension within
 //! a single original block (any combination of direct + cross-fn).
 
+// ToyStmt::User carries a label for source-readability; tests
+// construct labelled statements but don't read the labels.
+#![allow(dead_code)]
+
 use krio_async::{
     AsyncHooks, BlockKind, FrameState, LivenessMap, SuspendingFns, SuspensionSite,
     transform_to_state_machine,
