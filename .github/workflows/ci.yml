@@ -39,9 +39,8 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy rustfmt
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt --target "${{ matrix.target }}"
           rustup default "$RUST_TOOLCHAIN"
-          rustup target add "${{ matrix.target }}"
 
       - name: Show toolchain
         run: rustc -vV
