@@ -33,15 +33,22 @@ jobs:
           - name: Linux x86_64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            run_tests: true
+            test_extra_args: ""
           - name: macOS x86_64
             runner: macos-15-intel
             target: x86_64-apple-darwin
-            run_tests: true
+            test_extra_args: ""
+          # krio-fiber's context-switch asm is SysV-ABI (args in
+          # rdi/rsi, SysV callee-saved set). Windows x86_64 uses the
+          # MS x64 ABI (args in rcx/rdx, different callee-saved set),
+          # so the asm compiles via LLVM but would read/write garbage
+          # at runtime. Clippy still covers krio-fiber + krio-preempt
+          # on Windows; tests skip them until the asm grows an MS x64
+          # variant.
           - name: Windows x86_64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
-            run_tests: false
+            test_extra_args: "--exclude krio-fiber --exclude krio-preempt"
 
     steps:
       - name: Checkout
@@ -62,5 +69,4 @@ jobs:
         run: cargo clippy --workspace --all-targets --target "${{ matrix.target }}" -- -D warnings
 
       - name: Run tests
-        if: matrix.run_tests
-        run: cargo test --workspace --target "${{ matrix.target }}"
+        run: cargo test --workspace ${{ matrix.test_extra_args }} --target "${{ matrix.target }}"

@@ -29,6 +29,15 @@ unsafe extern "C" {
     pub fn krio_fiber_switch(save_to: *mut *mut u8, load_from: *const *mut u8);
 }
 
+// SysV x86_64: args land in rdi/rsi and the callee-saved set is
+// {rbp, rbx, r12..r15}. LLVM also accepts this AT&T-syntax block on
+// x86_64-pc-windows-msvc, so the crate compiles + clippy-checks on
+// Windows — but the Microsoft x64 ABI passes args in rcx/rdx and
+// preserves a different register set (rsi/rdi plus xmm6..xmm15), so
+// the resulting context switch reads/writes garbage at runtime. CI
+// excludes krio-fiber + krio-preempt from `cargo test` on Windows
+// for that reason. A future MS x64 port can branch via
+// `cfg(target_env = "msvc")` and emit a parallel implementation.
 #[cfg(target_arch = "x86_64")]
 global_asm!(
     r#"
