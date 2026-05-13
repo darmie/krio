@@ -61,22 +61,37 @@ global_asm!(
 // Microsoft x64 (Windows): args land in rcx/rdx and the callee-saved
 // set is {rbp, rbx, rdi, rsi, r12..r15} plus xmm6..xmm15. We save
 // the eight callee-saved GP regs (8 × 8 = 64 bytes) and the ten
-// non-volatile xmm regs (10 × 16 = 160 bytes) — 224 bytes total.
+// non-volatile xmm regs (10 × 16 = 160 bytes).
 //
-// TEB-resident StackBase / StackLimit / DeallocationStack fields
-// (GS:[0x08], GS:[0x10], GS:[0x1478]) are NOT swapped here. Windows
-// uses them for SEH unwinding and `__chkstk` page-probing on stack
-// allocations larger than one page; running on a fiber stack while
-// the TEB still describes the host thread's stack means SEH and
-// large stack frames inside fibers could misbehave. The test suite
-// avoids both, and the limitation matches every other "minimal"
-// fiber port. Documented on `Fiber::saved_fp` and tracked in the
-// crate README.
+// We also swap the per-thread TEB fields the Windows runtime uses to
+// bound stack walks:
+//   TEB.StackBase  at  gs:[0x08]  (high stack address)
+//   TEB.StackLimit at  gs:[0x10]  (low committed address)
+// SEH (`RtlLookupFunctionEntry`, `RtlUnwindEx`) refuses to walk past
+// rsp values outside `[StackLimit, StackBase]`. Without the swap,
+// `catch_unwind` in `fiber_run` can't catch a panic raised inside a
+// fiber — the unwinder bails as soon as rsp moves into the fiber's
+// heap-allocated stack and the panic terminates the process with the
+// MS C++ EH exit code 0xe06d7363.
+//
+// The fiber's StackBase / StackLimit are seeded by
+// `super::fiber::prepare_initial_stack`. On every switch we save the
+// outgoing side's current TEB values onto its own stack and load the
+// incoming side's saved values into the TEB. Total saved-frame size
+// is therefore 240 bytes: 160 (xmm) + 64 (GP) + 16 (TEB pair).
+//
+// `TEB.DeallocationStack` at gs:[0x1478] is left untouched. It's
+// only consulted by Win32 thread-cleanup paths the runtime never
+// hits in-fiber.
 #[cfg(all(target_arch = "x86_64", windows))]
 global_asm!(
     r#"
     .global krio_fiber_switch
     krio_fiber_switch:
+        movq   %gs:0x08, %rax
+        push   %rax
+        movq   %gs:0x10, %rax
+        push   %rax
         push   %rbp
         push   %rbx
         push   %rdi
@@ -117,6 +132,10 @@ global_asm!(
         pop    %rdi
         pop    %rbx
         pop    %rbp
+        pop    %rax
+        movq   %rax, %gs:0x10
+        pop    %rax
+        movq   %rax, %gs:0x08
         ret
     "#,
     options(att_syntax)
@@ -165,7 +184,7 @@ compile_error!(
 pub const SAVED_FRAME_BYTES: usize = 6 * 8; // rbp, rbx, r12, r13, r14, r15
 
 #[cfg(all(target_arch = "x86_64", windows))]
-pub const SAVED_FRAME_BYTES: usize = 8 * 8 + 10 * 16; // 8 GP + 10 xmm = 224
+pub const SAVED_FRAME_BYTES: usize = 8 * 8 + 10 * 16 + 16; // 8 GP + 10 xmm + 2 TEB = 240
 
 #[cfg(target_arch = "aarch64")]
 pub const SAVED_FRAME_BYTES: usize = 112; // 12 callee-saved regs + alignment slot
@@ -193,7 +212,7 @@ pub const SAVED_FP_OFFSET: usize = 80; // x29 lives at sp+80 (see stp pair)
 pub const SAVED_RET_OFFSET: usize = 48; // ret_addr sits above the 6 saved regs
 
 #[cfg(all(target_arch = "x86_64", windows))]
-pub const SAVED_RET_OFFSET: usize = 224; // ret_addr sits above the full 224-byte frame
+pub const SAVED_RET_OFFSET: usize = 240; // ret_addr sits above the full 240-byte frame
 
 #[cfg(target_arch = "aarch64")]
 pub const SAVED_RET_OFFSET: usize = 88; // x30 lives at sp+88 (companion of x29)

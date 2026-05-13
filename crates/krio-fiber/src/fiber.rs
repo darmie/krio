@@ -615,6 +615,12 @@ unsafe fn prepare_initial_stack(stack: &mut [u8], state: *mut TrampolineState) -
         // Architecture-specific: place the trampoline as the
         // "return address" the saved frame pops on switch-in,
         // followed by zeroed callee-saved register slots.
+        #[cfg(all(target_arch = "x86_64", windows))]
+        {
+            let stack_limit = stack.as_mut_ptr();
+            prepare_initial_stack_arch(top, stack_limit, state)
+        }
+        #[cfg(not(all(target_arch = "x86_64", windows)))]
         prepare_initial_stack_arch(top, state)
     }
 }
@@ -658,23 +664,35 @@ unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) 
 }
 
 #[cfg(all(target_arch = "x86_64", windows))]
-unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) -> *mut u8 {
+unsafe fn prepare_initial_stack_arch(
+    top: *mut u8,
+    stack_limit: *mut u8,
+    state: *mut TrampolineState,
+) -> *mut u8 {
     // MS x64 saved-frame layout (low → high addresses):
     //   sp+0   .. sp+144 : xmm6..xmm15 (10 × 16 bytes = 160)
     //   sp+160 .. sp+216 : r15, r14, r13, r12, rsi, rdi, rbx, rbp
-    //   sp+224           : trampoline_addr (the saved return addr)
-    // Total: 232 bytes from sp to (top-of-frame).
+    //   sp+224           : TEB.StackLimit save slot
+    //   sp+232           : TEB.StackBase save slot
+    //   sp+240           : trampoline_addr (the saved return addr)
+    // Total: 248 bytes from sp to (top-of-frame).
     //
     // `state` is stashed in the r12 slot (sp+184) — the MS x64
     // callee-saved set includes r12, so the trampoline observes it
-    // on first entry.
+    // on first entry. The TEB slots are seeded so that the first
+    // switch-in writes the fiber's stack range to gs:[0x08]/[0x10],
+    // which lets SEH walk through the fiber's frames (necessary for
+    // catch_unwind in `fiber_run`).
     let sp = unsafe { top.sub(SAVED_FRAME_BYTES + 8) };
     unsafe {
-        // Zero the whole 224-byte saved-register region (xmm + GP).
         core::ptr::write_bytes(sp, 0, SAVED_FRAME_BYTES);
-        // Overwrite the r12 slot with the trampoline state pointer.
+        // Trampoline state for r12.
         (sp.add(184) as *mut usize).write(state as usize);
-        // ret_addr slot (sp + SAVED_RET_OFFSET) gets the trampoline.
+        // TEB.StackLimit: the low end of the fiber's usable stack.
+        (sp.add(224) as *mut usize).write(stack_limit as usize);
+        // TEB.StackBase: the high end (= the aligned `top`).
+        (sp.add(232) as *mut usize).write(top as usize);
+        // ret_addr slot — trampoline entry point.
         (sp.add(SAVED_RET_OFFSET) as *mut usize)
             .write(fiber_trampoline_x86_64 as *const () as usize);
     }
