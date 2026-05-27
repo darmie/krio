@@ -91,6 +91,19 @@ pub struct Fiber {
     /// Value handed out by the fiber's `yield_value(v)`. The host
     /// reads it via [`Fiber::take_yield_value`] after resume.
     output_slot: Cell<Option<Box<dyn Any + 'static>>>,
+    /// `u64` fast-path slots. The generic `<I>` / `<O>` API above
+    /// always allocates a fresh `Box<dyn Any>` per resume/yield;
+    /// hosts whose only payload is a fixed-size scalar (e.g. a
+    /// NaN-boxed VM value) pay one `Box::new` + one drop per
+    /// fiber switch, which dominates allocator traffic in a tight
+    /// yield loop. These slots skip the box entirely. Filled via
+    /// [`Fiber::resume_with_u64`] / [`yield_u64`]; read via
+    /// [`Fiber::take_yield_u64`] / [`take_input_u64`]. The generic
+    /// slots are left in place so heterogeneous payloads still
+    /// work — callers pick the API matching their payload type.
+    input_u64: Cell<Option<u64>>,
+    /// See [`Fiber::input_u64`].
+    output_u64: Cell<Option<u64>>,
     /// Process-unique id. Stable across resumes; useful for tagging
     /// fibers in logs and scheduler queues.
     id: u64,
@@ -200,6 +213,8 @@ impl Fiber {
             deadline_ms: None,
             input_slot: Cell::new(None),
             output_slot: Cell::new(None),
+            input_u64: Cell::new(None),
+            output_u64: Cell::new(None),
             id: next_fiber_id(),
             name: None,
             _trampoline_state: state,
@@ -257,6 +272,24 @@ impl Fiber {
         self.input_slot
             .set(Some(Box::new(input) as Box<dyn Any + 'static>));
         self.resume()
+    }
+
+    /// `u64` fast path for [`Fiber::resume_with`]. Skips the
+    /// `Box<dyn Any>` allocation in `resume_with::<u64>`. Use
+    /// in tight yield/resume loops where the payload is a fixed
+    /// scalar (e.g. a NaN-boxed VM value).
+    pub fn resume_with_u64(&mut self, input: u64) -> FiberStep {
+        self.input_u64.set(Some(input));
+        self.resume()
+    }
+
+    /// Take the most recent yield as `u64`, paired with [`yield_u64`].
+    /// Returns `None` if the fiber didn't yield via the `u64` fast
+    /// path (e.g. it used the generic [`yield_value`]); the generic
+    /// `output_slot` is left untouched so the caller can still call
+    /// [`Fiber::take_yield_any`] for the boxed value.
+    pub fn take_yield_u64(&self) -> Option<u64> {
+        self.output_u64.take()
     }
 
     /// Take the value the fiber most recently yielded. Returns
@@ -523,6 +556,46 @@ pub fn yield_value<O: 'static, I: 'static>(value: O) -> Option<I> {
     yield_now();
     let received = unsafe { (*fiber_ptr).input_slot.take() };
     received.and_then(|b| b.downcast::<I>().ok().map(|b| *b))
+}
+
+/// `u64` fast path for [`yield_value`]. Stores `value` in the
+/// fiber's `output_u64` slot (no `Box<dyn Any>` allocation),
+/// suspends, and on resume returns whatever the host passed via
+/// [`Fiber::resume_with_u64`].
+///
+/// Host-side counterpart: [`Fiber::take_yield_u64`] /
+/// [`Fiber::resume_with_u64`]. The generic [`yield_value`] /
+/// [`Fiber::take_yield_value`] pair stays in place — choose
+/// whichever matches your payload type.
+///
+/// # Panics
+/// Panics if called outside a fiber.
+pub fn yield_u64(value: u64) -> Option<u64> {
+    let fiber_ptr = ACTIVE_FIBER.with(|cell| cell.get());
+    assert!(
+        !fiber_ptr.is_null(),
+        "yield_u64: called outside of any active fiber"
+    );
+    // SAFETY: same lifetime invariants as `yield_value`.
+    unsafe {
+        (*fiber_ptr).output_u64.set(Some(value));
+    }
+    yield_now();
+    unsafe { (*fiber_ptr).input_u64.take() }
+}
+
+/// `u64` fast path for [`take_input`]. Returns whatever the host
+/// passed via [`Fiber::resume_with_u64`].
+///
+/// # Panics
+/// Panics if called outside a fiber.
+pub fn take_input_u64() -> Option<u64> {
+    let fiber_ptr = ACTIVE_FIBER.with(|cell| cell.get());
+    assert!(
+        !fiber_ptr.is_null(),
+        "take_input_u64: called outside of any active fiber"
+    );
+    unsafe { (*fiber_ptr).input_u64.take() }
 }
 
 /// Take whatever input the host most recently passed via
