@@ -14,8 +14,10 @@
 //! [`super::fiber::prepare_initial_stack`] to look like a saved
 //! frame whose return address points at the fiber's trampoline.
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use core::arch::global_asm;
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 unsafe extern "C" {
     /// Save the current context onto the current stack, then switch
     /// to the context whose stack pointer is at `*load_from`. Writes
@@ -171,11 +173,19 @@ global_asm!(
     "#
 );
 
+// Unsupported targets (e.g. wasm32): stack-based context switching has no
+// implementation. The crate still needs to *compile* — it is pulled in
+// transitively on targets that drive concurrency through the stackless
+// `krio-async` path instead of native fibers. `krio_fiber_switch` compiles
+// but panics if actually invoked; the layout constants are inert zeros.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-compile_error!(
-    "krio-fiber: context switch not yet implemented for this target. \
-     Supported: x86_64, aarch64."
-);
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krio_fiber_switch(_save_to: *mut *mut u8, _load_from: *const *mut u8) {
+    panic!(
+        "krio-fiber: native context switching is unavailable on this target; \
+         drive concurrency through the stackless krio-async path instead"
+    );
+}
 
 /// Number of bytes [`krio_fiber_switch`] pushes onto the stack
 /// during a save. Used by [`super::fiber::prepare_initial_stack`]
@@ -216,3 +226,12 @@ pub const SAVED_RET_OFFSET: usize = 240; // ret_addr sits above the full 240-byt
 
 #[cfg(target_arch = "aarch64")]
 pub const SAVED_RET_OFFSET: usize = 88; // x30 lives at sp+88 (companion of x29)
+
+// Inert layout constants for targets without a native context switch — the
+// fiber path is never entered at runtime on these (see `krio_fiber_switch`).
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub const SAVED_FRAME_BYTES: usize = 0;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub const SAVED_FP_OFFSET: usize = 0;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub const SAVED_RET_OFFSET: usize = 0;

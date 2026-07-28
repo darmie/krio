@@ -122,6 +122,12 @@ pub struct Fiber {
 /// Pointed at by the trampoline; carries the closure + a back-pointer
 /// to the fiber's `done` flag and `caller_sp` for `yield_now`.
 struct TrampolineState {
+    // Consumed by `fiber_run`, which only exists on targets with a native
+    // context switch; unused (but still allocated) on unsupported targets.
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
     closure: Option<Box<dyn FnOnce()>>,
     /// Pointer to the parent fiber's `done` flag. Set after the
     /// closure returns or panics.
@@ -794,6 +800,14 @@ unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) 
     sp
 }
 
+// Unsupported targets (e.g. wasm32): no native stack to lay out. Compiles
+// so the crate builds where it is pulled in transitively; never reached at
+// runtime because fiber creation itself is not exercised there.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+unsafe fn prepare_initial_stack_arch(_top: *mut u8, _state: *mut TrampolineState) -> *mut u8 {
+    panic!("krio-fiber: native fibers are unavailable on this target");
+}
+
 // ── Trampolines ───────────────────────────────────────────────────
 
 #[cfg(all(target_arch = "x86_64", not(windows)))]
@@ -840,6 +854,10 @@ unsafe extern "C" fn fiber_trampoline_aarch64() {
 /// The body of a fiber. Receives a pointer to the trampoline state,
 /// runs the closure, marks the fiber done, and switches back to the
 /// caller. Never returns to its caller (the trampoline's tail).
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 extern "C" fn fiber_run(state_ptr: *mut TrampolineState) -> ! {
     // SAFETY: `state_ptr` is the heap-allocated state from Fiber::new
     // / Fiber::resume; valid for the fiber's lifetime.
