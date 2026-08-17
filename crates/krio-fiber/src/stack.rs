@@ -52,6 +52,11 @@ impl Stack {
         self.usable_start
     }
 
+    /// Length of the usable region in bytes.
+    pub(crate) fn usable_len(&self) -> usize {
+        self.usable_len
+    }
+
     /// Slice of the usable region. Shared mutable view — caller
     /// must respect aliasing rules.
     pub(crate) fn usable_slice_mut(&mut self) -> &mut [u8] {

@@ -397,6 +397,34 @@ impl Fiber {
         self.fiber_sp
     }
 
+    /// The fiber's usable stack region as `(lowest_addr, len)` —
+    /// excludes the guard page. For conservative GC scanning, the
+    /// live window of a suspended fiber is
+    /// `[saved_sp, lowest_addr + len)`: the context switch spills all
+    /// callee-saved registers (including d8-d15) onto the stack at
+    /// `saved_sp` before switching away, so a word-by-word scan of
+    /// that window covers register-resident pointers too.
+    ///
+    /// The region is owned by this `Fiber` and stays valid (and
+    /// address-stable) until the `Fiber` is dropped — unregister it
+    /// from any scanner before dropping.
+    pub fn stack_range(&self) -> (*const u8, usize) {
+        (
+            self._stack.usable_start() as *const u8,
+            self._stack.usable_len(),
+        )
+    }
+
+    /// The HOST-side stack pointer saved when this fiber was last
+    /// resumed, or null if the fiber is not currently running. While
+    /// the fiber runs, the host stack is suspended at this SP — a
+    /// conservative scanner walking the host stack should scan
+    /// `[caller_sp, host_stack_top)` instead of probing a live SP
+    /// that now points into the fiber's stack.
+    pub fn caller_sp(&self) -> *const u8 {
+        self.caller_sp
+    }
+
     /// Read the saved frame-pointer register (`rbp` on x86_64, `x29`
     /// on aarch64) from a suspended fiber's saved-registers region.
     /// This is the entry point a frame-chain walker uses to traverse
@@ -795,7 +823,11 @@ unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) 
         }
         // x30 (return address) at offset 88
         (sp.add(88) as *mut usize).write(fiber_trampoline_aarch64 as *const () as usize);
-        // pad slot at offset 96, leave zeroed
+        // d8-d15 slots at [96, 160) + pad to 176: zero explicitly so the
+        // first restore loads clean FP state even on non-mmap stacks.
+        for i in 12..22 {
+            (sp.add(i * 8) as *mut usize).write(0);
+        }
     }
     sp
 }

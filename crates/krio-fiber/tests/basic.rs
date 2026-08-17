@@ -567,3 +567,58 @@ fn saved_fp_chain_terminates_cleanly() {
         "walker must terminate (max_frames hit)"
     );
 }
+
+/// Regression: aarch64 switch must preserve callee-saved FP regs (d8-d15).
+/// Pressure both sides with f64 locals live across the switch so LLVM
+/// allocates callee-saved d-registers; with the old 112-byte frame (GP
+/// only), values on either side of the switch got clobbered.
+#[test]
+fn fp_callee_saved_survive_switch() {
+    use krio_fiber::{Fiber, yield_now};
+    #[inline(never)]
+    fn noise(seed: f64) -> f64 {
+        // Defeat const-folding.
+        std::hint::black_box(seed) * 1.000000001
+    }
+    let mut fib = Fiber::new(|| {
+        let a = noise(1.5);
+        let b = noise(2.5);
+        let c = noise(3.5);
+        let d = noise(4.5);
+        let e = noise(5.5);
+        let f = noise(6.5);
+        let g = noise(7.5);
+        let h = noise(8.5);
+        for _ in 0..64 {
+            yield_now();
+            // All eight must be bit-identical after every switch.
+            assert_eq!(a, noise(1.5));
+            assert_eq!(b, noise(2.5));
+            assert_eq!(c, noise(3.5));
+            assert_eq!(d, noise(4.5));
+            assert_eq!(e, noise(5.5));
+            assert_eq!(f, noise(6.5));
+            assert_eq!(g, noise(7.5));
+            assert_eq!(h, noise(8.5));
+        }
+    });
+    let ha = noise(11.5);
+    let hb = noise(12.5);
+    let hc = noise(13.5);
+    let hd = noise(14.5);
+    let he = noise(15.5);
+    let hf = noise(16.5);
+    let hg = noise(17.5);
+    let hh = noise(18.5);
+    while !fib.is_done() {
+        fib.resume();
+        assert_eq!(ha, noise(11.5));
+        assert_eq!(hb, noise(12.5));
+        assert_eq!(hc, noise(13.5));
+        assert_eq!(hd, noise(14.5));
+        assert_eq!(he, noise(15.5));
+        assert_eq!(hf, noise(16.5));
+        assert_eq!(hg, noise(17.5));
+        assert_eq!(hh, noise(18.5));
+    }
+}

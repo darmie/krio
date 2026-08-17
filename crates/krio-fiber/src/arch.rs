@@ -150,14 +150,22 @@ global_asm!(
     .global krio_fiber_switch
     _krio_fiber_switch:
     krio_fiber_switch:
-        sub  sp, sp, #112
+        sub  sp, sp, #176
         stp  x19, x20, [sp, #0]
         stp  x21, x22, [sp, #16]
         stp  x23, x24, [sp, #32]
         stp  x25, x26, [sp, #48]
         stp  x27, x28, [sp, #64]
         stp  x29, x30, [sp, #80]
-        // sp slot at [96] reserved for alignment
+        // AAPCS64 also makes the low 64 bits of v8-v15 callee-saved;
+        // extern "C" callers may keep live doubles there across a
+        // yield/resume, so they must ride the frame too (d-regs at
+        // [96, 160); pad to 176 keeps 16-byte alignment). GP layout
+        // above is unchanged so SAVED_FP_OFFSET/SAVED_RET_OFFSET hold.
+        stp  d8,  d9,  [sp, #96]
+        stp  d10, d11, [sp, #112]
+        stp  d12, d13, [sp, #128]
+        stp  d14, d15, [sp, #144]
         mov  x9, sp
         str  x9, [x0]
         ldr  x9, [x1]
@@ -168,7 +176,11 @@ global_asm!(
         ldp  x25, x26, [sp, #48]
         ldp  x27, x28, [sp, #64]
         ldp  x29, x30, [sp, #80]
-        add  sp, sp, #112
+        ldp  d8,  d9,  [sp, #96]
+        ldp  d10, d11, [sp, #112]
+        ldp  d12, d13, [sp, #128]
+        ldp  d14, d15, [sp, #144]
+        add  sp, sp, #176
         ret
     "#
 );
@@ -197,7 +209,7 @@ pub const SAVED_FRAME_BYTES: usize = 6 * 8; // rbp, rbx, r12, r13, r14, r15
 pub const SAVED_FRAME_BYTES: usize = 8 * 8 + 10 * 16 + 16; // 8 GP + 10 xmm + 2 TEB = 240
 
 #[cfg(target_arch = "aarch64")]
-pub const SAVED_FRAME_BYTES: usize = 112; // 12 callee-saved regs + alignment slot
+pub const SAVED_FRAME_BYTES: usize = 176; // 12 GP + 8 FP callee-saved regs + alignment pad
 
 /// Byte offset, from a suspended fiber's [`super::Fiber::saved_sp`],
 /// of the saved frame-pointer register (`rbp` on x86_64, `x29` on
