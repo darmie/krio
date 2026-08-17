@@ -23,16 +23,40 @@ defaults:
     shell: bash
 
 jobs:
+  # krio-fiber's asm context switch is per-(arch, ABI), and its correctness
+  # properties are arch-ASYMMETRIC — a test can pass vacuously on one arch
+  # while the bug it guards against is live on another. The clearest case:
+  # x86_64 SysV has no callee-saved FP registers at all, so the d8-d15
+  # regression test compiles into caller-saved xmm slots there and passes
+  # no matter what the switch does. It is only meaningful on aarch64
+  # (d8-d15) and MS x64 (xmm6-xmm15). Hence:
+  #
+  #   * an aarch64 row on both Linux and macOS — aarch64 is the arch
+  #     krio's main consumer actually ships on, and it previously had
+  #     zero CI coverage;
+  #   * a `profile` axis — register allocation and spill decisions differ
+  #     substantially at opt-level 3, and a switch bug that debug-mode
+  #     stack traffic papers over can surface only in release.
+  #
+  # `macos-latest` is arm64 (has been since macos-14), which is why the
+  # x86_64 macOS row has to name `macos-15-intel` explicitly.
   test:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.platform.name }} (${{ matrix.profile }})
+    runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        profile: [debug, release]
+        platform:
           - name: Linux x86_64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - name: Linux aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: macOS aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
           - name: macOS x86_64
             runner: macos-15-intel
             target: x86_64-apple-darwin
@@ -46,17 +70,57 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt --target "${{ matrix.target }}"
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt --target "${{ matrix.platform.target }}"
           rustup default "$RUST_TOOLCHAIN"
 
       - name: Show toolchain
         run: rustc -vV
 
+      # Lints are profile-independent; run them once per platform.
       - name: Check formatting
+        if: matrix.profile == 'debug'
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --target "${{ matrix.target }}" -- -D warnings
+        if: matrix.profile == 'debug'
+        run: cargo clippy --workspace --all-targets --target "${{ matrix.platform.target }}" -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace --target "${{ matrix.target }}"
+        run: |
+          flags=""
+          if [ "${{ matrix.profile }}" = "release" ]; then flags="--release"; fi
+          cargo test --workspace --target "${{ matrix.platform.target }}" $flags
+
+  # krio-fiber must still *compile* on targets it does not implement a
+  # context switch for — it gets pulled in transitively by consumers that
+  # drive concurrency through the stackless krio-async path. Two classes
+  # matter enough to gate on:
+  #
+  #   * wasm32 — no addressable switchable stack exists, permanently the
+  #     panic-stub path;
+  #   * aarch64-pc-windows-msvc — an unqualified `cfg(target_arch =
+  #     "aarch64")` used to emit the AAPCS64 switch there with no TEB
+  #     handling and no guard page, producing a build that switched
+  #     correctly and then died on the first panic crossing a fiber
+  #     boundary. It is now an explicit panic stub; this job keeps it
+  #     from silently regressing back into a "working" broken switch.
+  cross-check:
+    name: Cross-compile ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-pc-windows-msvc
+          - wasm32-unknown-unknown
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "${{ matrix.target }}"
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Build krio-fiber
+        run: cargo build -p krio-fiber --target "${{ matrix.target }}"
