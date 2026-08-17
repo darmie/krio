@@ -123,9 +123,11 @@ pub struct Fiber {
 /// to the fiber's `done` flag and `caller_sp` for `yield_now`.
 struct TrampolineState {
     // Consumed by `fiber_run`, which only exists on targets with a native
-    // context switch; unused (but still allocated) on unsupported targets.
+    // context switch; unused (but still allocated) on unsupported targets
+    // (see `crate::arch` for which those are — note aarch64-windows is
+    // deliberately among them).
     #[cfg_attr(
-        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))),
         allow(dead_code)
     )]
     closure: Option<Box<dyn FnOnce()>>,
@@ -823,7 +825,7 @@ unsafe fn prepare_initial_stack_arch(
     sp
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(windows)))]
 unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) -> *mut u8 {
     // The switch's restore sequence wants the stack (low to high) to
     // look like the saved frame produced by the asm save:
@@ -853,10 +855,12 @@ unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) 
     sp
 }
 
-// Unsupported targets (e.g. wasm32): no native stack to lay out. Compiles
-// so the crate builds where it is pulled in transitively; never reached at
-// runtime because fiber creation itself is not exercised there.
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+// Unsupported targets (wasm32, riscv64, aarch64-windows, …): no native
+// stack to lay out. Compiles so the crate builds where it is pulled in
+// transitively. Note this panics from `Fiber::with_stack_size`, i.e.
+// `Fiber::new` itself fails loudly on these targets rather than handing
+// back a fiber that dies later.
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
 unsafe fn prepare_initial_stack_arch(_top: *mut u8, _state: *mut TrampolineState) -> *mut u8 {
     panic!("krio-fiber: native fibers are unavailable on this target");
 }
@@ -894,7 +898,7 @@ unsafe extern "C" fn fiber_trampoline_x86_64() {
     )
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(windows)))]
 #[unsafe(naked)]
 unsafe extern "C" fn fiber_trampoline_aarch64() {
     // x19 holds the TrampolineState pointer. Move to x0 and call
@@ -908,7 +912,7 @@ unsafe extern "C" fn fiber_trampoline_aarch64() {
 /// runs the closure, marks the fiber done, and switches back to the
 /// caller. Never returns to its caller (the trampoline's tail).
 #[cfg_attr(
-    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))),
     allow(dead_code)
 )]
 extern "C" fn fiber_run(state_ptr: *mut TrampolineState) -> ! {

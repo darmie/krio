@@ -25,11 +25,15 @@
 //!
 //! ## Status
 //!
-//! - x86_64 + aarch64 context-switch (System V / AAPCS64).
-//!   Callee-saved GP registers, callee-saved FP registers, and the
-//!   callee-saved FP control word (MXCSR + x87 CW on x86_64, `FPCR`
-//!   on aarch64) all ride the saved frame, so a fiber cannot leak its
-//!   rounding mode into its host.
+//! - Context switch on `x86_64` (System V + MS x64) and on `aarch64`
+//!   for non-Windows targets (AAPCS64). Callee-saved GP registers,
+//!   callee-saved FP registers, and the callee-saved FP control word
+//!   (MXCSR + x87 CW on x86_64, `FPCR` on aarch64) all ride the saved
+//!   frame, so a fiber cannot leak its rounding mode into its host.
+//! - `aarch64-pc-windows-*` is **not** supported: it needs the TEB
+//!   stack-bounds swap the MS x64 path does (without it SEH cannot
+//!   unwind out of a fiber) plus a guard-page allocator, so it takes
+//!   the panic-stub path instead of silently mis-switching.
 //! - Single-threaded; `Fiber` is `!Send`.
 //! - **Unix**: stacks allocated via `mmap` with a `PROT_NONE` guard
 //!   page below the usable region — stack overflow traps with
@@ -56,7 +60,10 @@
 //! - Symmetric `transfer` semantics (abandon the current fiber's
 //!   continuation, switch to a peer with the original caller). The
 //!   nested-call form covers most use cases.
-//! - Targets beyond x86_64 + aarch64.
+//! - Targets beyond x86_64 + aarch64-non-Windows. ARM64 Windows is
+//!   the closest: it reaches the TEB through `x18` (which the AAPCS64
+//!   switch never touches, since Windows reserves it) rather than the
+//!   `gs:`-relative moves x64 uses.
 //!
 //! ## Where this fits in the krio family
 //!

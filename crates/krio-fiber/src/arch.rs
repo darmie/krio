@@ -26,11 +26,27 @@
 //! round-toward-zero and then yields silently changes the host's
 //! arithmetic. They therefore ride the saved frame alongside the
 //! callee-saved registers.
+//!
+//! ## Supported targets
+//!
+//! `x86_64` (SysV and MS x64) and `aarch64` on non-Windows targets.
+//! `aarch64-pc-windows-*` is deliberately *not* claimed: the AAPCS64
+//! switch below is ABI-correct for the registers, but ARM64 Windows
+//! also requires swapping the per-thread TEB stack bounds (see the MS
+//! x64 block) or SEH refuses to unwind out of a fiber, and
+//! [`super::stack`] has no guard-page allocator there either. Rather
+//! than compile into a switch that works until the first panic
+//! crosses a fiber boundary, ARM64 Windows takes the unsupported
+//! path and panics honestly. A real port is not large: ARM64 Windows
+//! keeps the TEB pointer in `x18` (which the AAPCS64 asm below
+//! correctly never touches, since Windows reserves it), so the TEB
+//! swap is a pair of `ldr`/`str` through `x18` instead of the
+//! `gs:`-relative moves used on x64.
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows))))]
 use core::arch::global_asm;
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows))))]
 unsafe extern "C" {
     /// Save the current context onto the current stack, then switch
     /// to the context whose stack pointer is at `*load_from`. Writes
@@ -177,7 +193,9 @@ global_asm!(
     options(att_syntax)
 );
 
-#[cfg(target_arch = "aarch64")]
+// AAPCS64, non-Windows. ARM64 Windows deliberately falls through to
+// the unsupported arm below — see the module docs.
+#[cfg(all(target_arch = "aarch64", not(windows)))]
 global_asm!(
     r#"
     .global _krio_fiber_switch
@@ -226,12 +244,25 @@ global_asm!(
     "#
 );
 
-// Unsupported targets (e.g. wasm32): stack-based context switching has no
-// implementation. The crate still needs to *compile* — it is pulled in
-// transitively on targets that drive concurrency through the stackless
-// `krio-async` path instead of native fibers. `krio_fiber_switch` compiles
-// but panics if actually invoked; the layout constants are inert zeros.
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+// Unsupported targets: stack-based context switching has no
+// implementation. Two groups land here:
+//
+//   * Architectures with no port at all (wasm32, riscv64, arm, x86-32,
+//     powerpc*, s390x, …). The crate still needs to *compile* — it is
+//     pulled in transitively on targets that drive concurrency through
+//     the stackless `krio-async` path instead of native fibers.
+//   * `aarch64-pc-windows-*`. The AAPCS64 register save above would
+//     assemble and run there, but ARM64 Windows additionally needs the
+//     TEB stack-bounds swap that the MS x64 path does (without it SEH
+//     refuses to unwind out of a fiber and the first panic crossing a
+//     fiber boundary kills the process with 0xe06d7363), and
+//     `super::stack` has no guard-page allocator for it. An honest
+//     panic beats a switch that works right up until the first
+//     exception. See the module docs for what a real port needs (x18).
+//
+// `krio_fiber_switch` compiles but panics if actually invoked; the
+// layout constants are inert zeros.
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn krio_fiber_switch(_save_to: *mut *mut u8, _load_from: *const *mut u8) {
     panic!(
@@ -249,7 +280,7 @@ pub const SAVED_FRAME_BYTES: usize = 6 * 8 + 16; // rbp, rbx, r12..r15 + MXCSR/x
 #[cfg(all(target_arch = "x86_64", windows))]
 pub const SAVED_FRAME_BYTES: usize = 8 * 8 + 10 * 16 + 16 + 16; // GP + xmm + TEB + FP ctl = 256
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(windows)))]
 pub const SAVED_FRAME_BYTES: usize = 192; // 12 GP + 8 FP regs + FPCR + alignment pad
 
 /// Byte offset, from a suspended fiber's [`super::Fiber::saved_sp`],
@@ -263,7 +294,7 @@ pub const SAVED_FP_OFFSET: usize = 56; // MXCSR/CW pad, r15,r14,r13,r12,rbx then
 #[cfg(all(target_arch = "x86_64", windows))]
 pub const SAVED_FP_OFFSET: usize = 232; // FP ctl, xmm6..xmm15, r15..r12, rsi, rdi, rbx, rbp
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(windows)))]
 pub const SAVED_FP_OFFSET: usize = 80; // x29 lives at sp+80 (see stp pair)
 
 /// Byte offset of the saved return address (instruction at which the
@@ -277,14 +308,14 @@ pub const SAVED_RET_OFFSET: usize = 64; // ret_addr sits above the full 64-byte 
 #[cfg(all(target_arch = "x86_64", windows))]
 pub const SAVED_RET_OFFSET: usize = 256; // ret_addr sits above the full 256-byte frame
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(windows)))]
 pub const SAVED_RET_OFFSET: usize = 88; // x30 lives at sp+88 (companion of x29)
 
 // Inert layout constants for targets without a native context switch — the
 // fiber path is never entered at runtime on these (see `krio_fiber_switch`).
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
 pub const SAVED_FRAME_BYTES: usize = 0;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
 pub const SAVED_FP_OFFSET: usize = 0;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
 pub const SAVED_RET_OFFSET: usize = 0;
