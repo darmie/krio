@@ -732,40 +732,50 @@ unsafe fn prepare_initial_stack(stack: &mut [u8], state: *mut TrampolineState) -
     }
 }
 
+/// Default MXCSR: all six SSE exceptions masked, round-to-nearest,
+/// flush-to-zero off. This is what the SysV process startup state and
+/// the CRT both install. **Must not be left as zero** — a zero MXCSR
+/// unmasks every SSE exception, so the first denormal or inexact
+/// result inside a brand-new fiber would raise SIGFPE.
+#[cfg(target_arch = "x86_64")]
+const DEFAULT_MXCSR: u32 = 0x1F80;
+
+/// Default x87 control word: extended precision, round-to-nearest,
+/// all six x87 exceptions masked. Same reasoning as [`DEFAULT_MXCSR`]
+/// — zero here would unmask the x87 exception set.
+#[cfg(target_arch = "x86_64")]
+const DEFAULT_X87_CW: u16 = 0x037F;
+
 #[cfg(all(target_arch = "x86_64", not(windows)))]
 unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) -> *mut u8 {
-    // The switch's `pop %r15..%rbp; ret` sequence wants the stack
-    // (low to high) to look like:
-    //   [r15][r14][r13][r12][rbx][rbp][trampoline_addr]
-    // So we push trampoline_addr first (highest of the seven slots),
-    // then six zeroed register slots below it. Final sp points at
-    // the bottom (the r15 slot).
-    let mut sp = top;
+    // SysV saved-frame layout (low → high addresses), mirroring the
+    // save path in `crate::arch`:
+    //   sp+0   : MXCSR            (4 bytes)
+    //   sp+4   : x87 control word (2 bytes)
+    //   sp+8   : pad
+    //   sp+16  : r15, r14, r13, r12, rbx, rbp
+    //   sp+64  : trampoline_addr (the saved return addr)
+    // Total: 72 bytes from sp to the top of the frame.
+    //
+    // `state` is stashed in the r12 slot (sp+40) — r12 is callee-saved
+    // on SysV, so the trampoline observes it on first entry.
+    //
+    // x86_64 SysV wants `%rsp % 16 == 8` on function entry because the
+    // `call` pushed an 8-byte return address. `top` is 16-aligned and
+    // `top - 72 ≡ 8 (mod 16)`, which is exactly the residue the switch's
+    // own save path produces, so the two agree.
+    let sp = unsafe { top.sub(SAVED_FRAME_BYTES + 8) };
     unsafe {
-        // x86_64 SysV: rsp must be 16-byte aligned + 8 (i.e.
-        // %rsp % 16 == 8) on function entry, because `call` would
-        // have pushed the 8-byte return address. Our `ret` will
-        // pop the trampoline addr → equivalent to entering the
-        // trampoline as a normal function call.
-        // After the 7 quadwords below, sp is `top - 56`. For 16-byte
-        // alignment + 8, we need top to be 16-aligned (it is — we
-        // aligned above).
-        sp = sp.sub(8);
-        (sp as *mut usize).write(fiber_trampoline_x86_64 as *const () as usize);
-        // 6 callee-saved register slots, zeroed.
-        for _ in 0..6 {
-            sp = sp.sub(8);
-            (sp as *mut usize).write(0);
-        }
-        // Stash `state` somewhere the trampoline can find it.
-        // x86_64: we'll pass it via rdi by emitting a tiny preamble
-        // in the trampoline that loads it from a known TLS / global
-        // location. Simpler: stash it in r12 (callee-saved) by
-        // overwriting the r12 slot.
-        // The pop order is r15, r14, r13, r12, rbx, rbp — so the
-        // r12 slot is the 4th from the bottom (offset 16 from sp).
-        let r12_slot = sp.add(8 * 3) as *mut usize;
-        r12_slot.write(state as usize);
+        core::ptr::write_bytes(sp, 0, SAVED_FRAME_BYTES);
+        // FP control state. Seeded with the ABI defaults rather than
+        // zero — see DEFAULT_MXCSR.
+        (sp as *mut u32).write(DEFAULT_MXCSR);
+        (sp.add(4) as *mut u16).write(DEFAULT_X87_CW);
+        // Trampoline state for r12.
+        (sp.add(40) as *mut usize).write(state as usize);
+        // ret_addr slot — trampoline entry point.
+        (sp.add(SAVED_RET_OFFSET) as *mut usize)
+            .write(fiber_trampoline_x86_64 as *const () as usize);
     }
     sp
 }
@@ -777,14 +787,17 @@ unsafe fn prepare_initial_stack_arch(
     state: *mut TrampolineState,
 ) -> *mut u8 {
     // MS x64 saved-frame layout (low → high addresses):
-    //   sp+0   .. sp+144 : xmm6..xmm15 (10 × 16 bytes = 160)
-    //   sp+160 .. sp+216 : r15, r14, r13, r12, rsi, rdi, rbx, rbp
-    //   sp+224           : TEB.StackLimit save slot
-    //   sp+232           : TEB.StackBase save slot
-    //   sp+240           : trampoline_addr (the saved return addr)
-    // Total: 248 bytes from sp to (top-of-frame).
+    //   sp+0             : MXCSR (4 bytes)
+    //   sp+4             : x87 control word (2 bytes)
+    //   sp+8             : pad
+    //   sp+16  .. sp+160 : xmm6..xmm15 (10 × 16 bytes = 160)
+    //   sp+176 .. sp+232 : r15, r14, r13, r12, rsi, rdi, rbx, rbp
+    //   sp+240           : TEB.StackLimit save slot
+    //   sp+248           : TEB.StackBase save slot
+    //   sp+256           : trampoline_addr (the saved return addr)
+    // Total: 264 bytes from sp to (top-of-frame).
     //
-    // `state` is stashed in the r12 slot (sp+184) — the MS x64
+    // `state` is stashed in the r12 slot (sp+200) — the MS x64
     // callee-saved set includes r12, so the trampoline observes it
     // on first entry. The TEB slots are seeded so that the first
     // switch-in writes the fiber's stack range to gs:[0x08]/[0x10],
@@ -793,12 +806,16 @@ unsafe fn prepare_initial_stack_arch(
     let sp = unsafe { top.sub(SAVED_FRAME_BYTES + 8) };
     unsafe {
         core::ptr::write_bytes(sp, 0, SAVED_FRAME_BYTES);
+        // FP control state. Seeded with the ABI defaults rather than
+        // zero — see DEFAULT_MXCSR.
+        (sp as *mut u32).write(DEFAULT_MXCSR);
+        (sp.add(4) as *mut u16).write(DEFAULT_X87_CW);
         // Trampoline state for r12.
-        (sp.add(184) as *mut usize).write(state as usize);
+        (sp.add(200) as *mut usize).write(state as usize);
         // TEB.StackLimit: the low end of the fiber's usable stack.
-        (sp.add(224) as *mut usize).write(stack_limit as usize);
+        (sp.add(240) as *mut usize).write(stack_limit as usize);
         // TEB.StackBase: the high end (= the aligned `top`).
-        (sp.add(232) as *mut usize).write(top as usize);
+        (sp.add(248) as *mut usize).write(top as usize);
         // ret_addr slot — trampoline entry point.
         (sp.add(SAVED_RET_OFFSET) as *mut usize)
             .write(fiber_trampoline_x86_64 as *const () as usize);
@@ -810,7 +827,8 @@ unsafe fn prepare_initial_stack_arch(
 unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) -> *mut u8 {
     // The switch's restore sequence wants the stack (low to high) to
     // look like the saved frame produced by the asm save:
-    //   [x19][x20][x21][x22][x23][x24][x25][x26][x27][x28][x29][x30][pad]
+    //   [x19][x20][x21][x22][x23][x24][x25][x26][x27][x28][x29][x30]
+    //   [d8..d15][fpcr][pad]
     // x30 is the return address — set it to the trampoline.
     // Stash `state` in x19 so the trampoline can recover it.
     let sp = unsafe { top.sub(SAVED_FRAME_BYTES) };
@@ -823,9 +841,12 @@ unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) 
         }
         // x30 (return address) at offset 88
         (sp.add(88) as *mut usize).write(fiber_trampoline_aarch64 as *const () as usize);
-        // d8-d15 slots at [96, 160) + pad to 176: zero explicitly so the
-        // first restore loads clean FP state even on non-mmap stacks.
-        for i in 12..22 {
+        // d8-d15 slots at [96, 160), FPCR at 160, pad to 192: zero
+        // explicitly so the first restore loads clean FP state even on
+        // non-mmap stacks. Unlike x86_64's MXCSR, an all-zero AArch64
+        // FPCR *is* the sane default — round-to-nearest with every
+        // exception trap disabled — so no seeding is needed here.
+        for i in 12..24 {
             (sp.add(i * 8) as *mut usize).write(0);
         }
     }

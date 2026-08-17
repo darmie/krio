@@ -26,6 +26,10 @@
 //! ## Status
 //!
 //! - x86_64 + aarch64 context-switch (System V / AAPCS64).
+//!   Callee-saved GP registers, callee-saved FP registers, and the
+//!   callee-saved FP control word (MXCSR + x87 CW on x86_64, `FPCR`
+//!   on aarch64) all ride the saved frame, so a fiber cannot leak its
+//!   rounding mode into its host.
 //! - Single-threaded; `Fiber` is `!Send`.
 //! - **Unix**: stacks allocated via `mmap` with a `PROT_NONE` guard
 //!   page below the usable region — stack overflow traps with

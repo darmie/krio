@@ -3,7 +3,8 @@
 //! Each architecture exports a single `extern "C"` symbol
 //! `krio_fiber_switch(save_to: *mut *mut u8, load_from: *const *mut u8)`:
 //!
-//! - Save callee-saved registers + the current return address onto
+//! - Save callee-saved registers, the callee-saved floating-point
+//!   control/rounding state, and the current return address onto
 //!   the current stack.
 //! - Write the resulting stack pointer through `save_to`.
 //! - Load the new stack pointer from `load_from`.
@@ -13,6 +14,18 @@
 //! The "initial state" of a fresh fiber's stack is constructed by
 //! [`super::fiber::prepare_initial_stack`] to look like a saved
 //! frame whose return address points at the fiber's trampoline.
+//!
+//! ## Floating-point control state
+//!
+//! Every ABI we implement makes the FP control/rounding word
+//! callee-saved: the SysV AMD64 psABI §3.2.1 for the MXCSR *control*
+//! bits and the x87 control word, MS x64 for the same pair, and
+//! AAPCS64 for `FPCR`. A switch that does not spill them lets a
+//! fiber's rounding mode (or its exception masks) leak into whoever
+//! resumed it — e.g. a native library that switches to
+//! round-toward-zero and then yields silently changes the host's
+//! arithmetic. They therefore ride the saved frame alongside the
+//! callee-saved registers.
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use core::arch::global_asm;
@@ -32,8 +45,17 @@ unsafe extern "C" {
 }
 
 // SysV x86_64: args land in rdi/rsi and the callee-saved set is
-// {rbp, rbx, r12..r15}. Used on Linux, macOS, and any other
-// non-Windows x86_64 target.
+// {rbp, rbx, r12..r15}. There are no callee-saved xmm registers on
+// SysV, but the MXCSR *control* bits and the x87 control word are
+// callee-saved (psABI §3.2.1), so those ride the frame too. Used on
+// Linux, macOS, and any other non-Windows x86_64 target.
+//
+// Saved frame, low → high address, from the saved sp:
+//   sp+0   : MXCSR      (4 bytes)
+//   sp+4   : x87 CW     (2 bytes, 2 bytes of pad after it)
+//   sp+8   : pad — keeps the 16-byte granularity of the sub
+//   sp+16  : r15, r14, r13, r12, rbx, rbp   (6 × 8 = 48)
+//   sp+64  : return address pushed by the `call`
 #[cfg(all(target_arch = "x86_64", not(windows)))]
 global_asm!(
     r#"
@@ -47,8 +69,14 @@ global_asm!(
         push   %r13
         push   %r14
         push   %r15
+        sub     $16, %rsp
+        stmxcsr (%rsp)
+        fnstcw  4(%rsp)
         mov    %rsp, (%rdi)
         mov    (%rsi), %rsp
+        ldmxcsr (%rsp)
+        fldcw   4(%rsp)
+        add     $16, %rsp
         pop    %r15
         pop    %r14
         pop    %r13
@@ -62,8 +90,9 @@ global_asm!(
 
 // Microsoft x64 (Windows): args land in rcx/rdx and the callee-saved
 // set is {rbp, rbx, rdi, rsi, r12..r15} plus xmm6..xmm15. We save
-// the eight callee-saved GP regs (8 × 8 = 64 bytes) and the ten
-// non-volatile xmm regs (10 × 16 = 160 bytes).
+// the eight callee-saved GP regs (8 × 8 = 64 bytes), the ten
+// non-volatile xmm regs (10 × 16 = 160 bytes) and the callee-saved
+// MXCSR / x87 control pair (16 bytes, of which 6 are used).
 //
 // We also swap the per-thread TEB fields the Windows runtime uses to
 // bound stack walks:
@@ -80,7 +109,8 @@ global_asm!(
 // `super::fiber::prepare_initial_stack`. On every switch we save the
 // outgoing side's current TEB values onto its own stack and load the
 // incoming side's saved values into the TEB. Total saved-frame size
-// is therefore 240 bytes: 160 (xmm) + 64 (GP) + 16 (TEB pair).
+// is therefore 256 bytes: 16 (FP control) + 160 (xmm) + 64 (GP) +
+// 16 (TEB pair).
 //
 // `TEB.DeallocationStack` at gs:[0x1478] is left untouched. It's
 // only consulted by Win32 thread-cleanup paths the runtime never
@@ -102,30 +132,34 @@ global_asm!(
         push   %r13
         push   %r14
         push   %r15
-        sub    $160, %rsp
-        movdqu %xmm6,  0(%rsp)
-        movdqu %xmm7,  16(%rsp)
-        movdqu %xmm8,  32(%rsp)
-        movdqu %xmm9,  48(%rsp)
-        movdqu %xmm10, 64(%rsp)
-        movdqu %xmm11, 80(%rsp)
-        movdqu %xmm12, 96(%rsp)
-        movdqu %xmm13, 112(%rsp)
-        movdqu %xmm14, 128(%rsp)
-        movdqu %xmm15, 144(%rsp)
+        sub    $176, %rsp
+        stmxcsr 0(%rsp)
+        fnstcw  4(%rsp)
+        movdqu %xmm6,  16(%rsp)
+        movdqu %xmm7,  32(%rsp)
+        movdqu %xmm8,  48(%rsp)
+        movdqu %xmm9,  64(%rsp)
+        movdqu %xmm10, 80(%rsp)
+        movdqu %xmm11, 96(%rsp)
+        movdqu %xmm12, 112(%rsp)
+        movdqu %xmm13, 128(%rsp)
+        movdqu %xmm14, 144(%rsp)
+        movdqu %xmm15, 160(%rsp)
         mov    %rsp, (%rcx)
         mov    (%rdx), %rsp
-        movdqu 0(%rsp),   %xmm6
-        movdqu 16(%rsp),  %xmm7
-        movdqu 32(%rsp),  %xmm8
-        movdqu 48(%rsp),  %xmm9
-        movdqu 64(%rsp),  %xmm10
-        movdqu 80(%rsp),  %xmm11
-        movdqu 96(%rsp),  %xmm12
-        movdqu 112(%rsp), %xmm13
-        movdqu 128(%rsp), %xmm14
-        movdqu 144(%rsp), %xmm15
-        add    $160, %rsp
+        ldmxcsr 0(%rsp)
+        fldcw   4(%rsp)
+        movdqu 16(%rsp),  %xmm6
+        movdqu 32(%rsp),  %xmm7
+        movdqu 48(%rsp),  %xmm8
+        movdqu 64(%rsp),  %xmm9
+        movdqu 80(%rsp),  %xmm10
+        movdqu 96(%rsp),  %xmm11
+        movdqu 112(%rsp), %xmm12
+        movdqu 128(%rsp), %xmm13
+        movdqu 144(%rsp), %xmm14
+        movdqu 160(%rsp), %xmm15
+        add    $176, %rsp
         pop    %r15
         pop    %r14
         pop    %r13
@@ -150,7 +184,7 @@ global_asm!(
     .global krio_fiber_switch
     _krio_fiber_switch:
     krio_fiber_switch:
-        sub  sp, sp, #176
+        sub  sp, sp, #192
         stp  x19, x20, [sp, #0]
         stp  x21, x22, [sp, #16]
         stp  x23, x24, [sp, #32]
@@ -166,6 +200,11 @@ global_asm!(
         stp  d10, d11, [sp, #112]
         stp  d12, d13, [sp, #128]
         stp  d14, d15, [sp, #144]
+        // AAPCS64 also makes FPCR (rounding mode + exception masks)
+        // callee-saved; it lives at [sp, #160] and the frame pads to
+        // 192. FPSR is *not* callee-saved, so it is left alone.
+        mrs  x9, fpcr
+        str  x9, [sp, #160]
         mov  x9, sp
         str  x9, [x0]
         ldr  x9, [x1]
@@ -180,7 +219,9 @@ global_asm!(
         ldp  d10, d11, [sp, #112]
         ldp  d12, d13, [sp, #128]
         ldp  d14, d15, [sp, #144]
-        add  sp, sp, #176
+        ldr  x9, [sp, #160]
+        msr  fpcr, x9
+        add  sp, sp, #192
         ret
     "#
 );
@@ -203,13 +244,13 @@ pub unsafe extern "C" fn krio_fiber_switch(_save_to: *mut *mut u8, _load_from: *
 /// during a save. Used by [`super::fiber::prepare_initial_stack`]
 /// to lay out the fake saved frame for a brand-new fiber.
 #[cfg(all(target_arch = "x86_64", not(windows)))]
-pub const SAVED_FRAME_BYTES: usize = 6 * 8; // rbp, rbx, r12, r13, r14, r15
+pub const SAVED_FRAME_BYTES: usize = 6 * 8 + 16; // rbp, rbx, r12..r15 + MXCSR/x87 CW
 
 #[cfg(all(target_arch = "x86_64", windows))]
-pub const SAVED_FRAME_BYTES: usize = 8 * 8 + 10 * 16 + 16; // 8 GP + 10 xmm + 2 TEB = 240
+pub const SAVED_FRAME_BYTES: usize = 8 * 8 + 10 * 16 + 16 + 16; // GP + xmm + TEB + FP ctl = 256
 
 #[cfg(target_arch = "aarch64")]
-pub const SAVED_FRAME_BYTES: usize = 176; // 12 GP + 8 FP callee-saved regs + alignment pad
+pub const SAVED_FRAME_BYTES: usize = 192; // 12 GP + 8 FP regs + FPCR + alignment pad
 
 /// Byte offset, from a suspended fiber's [`super::Fiber::saved_sp`],
 /// of the saved frame-pointer register (`rbp` on x86_64, `x29` on
@@ -217,10 +258,10 @@ pub const SAVED_FRAME_BYTES: usize = 176; // 12 GP + 8 FP callee-saved regs + al
 /// `*(saved_sp + SAVED_FP_OFFSET)`. Used by host GCs to walk the
 /// fiber's frames when scanning roots across a suspension.
 #[cfg(all(target_arch = "x86_64", not(windows)))]
-pub const SAVED_FP_OFFSET: usize = 40; // r15,r14,r13,r12,rbx then rbp at +40
+pub const SAVED_FP_OFFSET: usize = 56; // MXCSR/CW pad, r15,r14,r13,r12,rbx then rbp at +56
 
 #[cfg(all(target_arch = "x86_64", windows))]
-pub const SAVED_FP_OFFSET: usize = 216; // xmm6..xmm15, r15..r12, rsi, rdi, rbx, rbp
+pub const SAVED_FP_OFFSET: usize = 232; // FP ctl, xmm6..xmm15, r15..r12, rsi, rdi, rbx, rbp
 
 #[cfg(target_arch = "aarch64")]
 pub const SAVED_FP_OFFSET: usize = 80; // x29 lives at sp+80 (see stp pair)
@@ -231,10 +272,10 @@ pub const SAVED_FP_OFFSET: usize = 80; // x29 lives at sp+80 (see stp pair)
 /// to `krio_fiber_switch` and sits just above the saved registers.
 /// On aarch64 this is `x30`, saved alongside `x29` in the stp pair.
 #[cfg(all(target_arch = "x86_64", not(windows)))]
-pub const SAVED_RET_OFFSET: usize = 48; // ret_addr sits above the 6 saved regs
+pub const SAVED_RET_OFFSET: usize = 64; // ret_addr sits above the full 64-byte frame
 
 #[cfg(all(target_arch = "x86_64", windows))]
-pub const SAVED_RET_OFFSET: usize = 240; // ret_addr sits above the full 240-byte frame
+pub const SAVED_RET_OFFSET: usize = 256; // ret_addr sits above the full 256-byte frame
 
 #[cfg(target_arch = "aarch64")]
 pub const SAVED_RET_OFFSET: usize = 88; // x30 lives at sp+88 (companion of x29)
