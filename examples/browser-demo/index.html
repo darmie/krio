@@ -29,13 +29,19 @@ const status = document.getElementById('status');
 const out = document.getElementById('out');
 const say = (m) => { status.textContent = m; };
 
+// Steps a run must produce: every task takes `rounds` yielding steps
+// plus the one that returns Completed.
+const EXPECT_STEPS = TASKS * (ROUNDS + 1);
+
 function table(caption, rows) {
   const t = document.createElement('table');
   t.innerHTML = `<caption>${caption}</caption>
     <tr><th>agents</th><th>wall (ms)</th><th>max concurrent</th>
-        <th>steals</th><th>steps per agent</th></tr>` +
+        <th>steals</th><th>steps</th><th>steps per agent</th></tr>` +
     rows.map(r => `<tr><td>${r.agents}</td><td>${r.ms.toFixed(0)}</td>
-        <td>${r.maxConcurrent}</td><td>${r.steals}</td><td>${r.share}</td></tr>`).join('');
+        <td>${r.maxConcurrent}</td><td>${r.steals}</td>
+        <td class="${r.ok ? '' : 'bad'}">${r.steps}${r.ok ? '' : ' \u2717'}</td>
+        <td>${r.share}</td></tr>`).join('');
   out.appendChild(t);
 }
 
@@ -94,7 +100,14 @@ async function main() {
     const ms = performance.now() - t0;
 
     const [maxConcurrent, steals, ...share] = demo.stats_csv().split(',').map(Number);
-    rows[mode].push({ agents: AGENTS, ms, maxConcurrent, steals, share: share.join(' ') });
+    const steps = share.reduce((a, b) => a + b, 0);
+    // Self-check, so a run that measured the wrong thing says so on the
+    // page rather than looking plausible in someone's summary later.
+    const ok = steps === EXPECT_STEPS && maxConcurrent === AGENTS;
+    rows[mode].push({
+      agents: AGENTS, ms, maxConcurrent, steals, steps, ok,
+      share: share.join(' '),
+    });
   }
 
   table('spawn() — shared injector, every agent pulls its own', rows.injector);
@@ -106,7 +119,16 @@ async function main() {
 
   // Report back so a headless run can read real timings: no WebDriver,
   // and no --virtual-time-budget distorting performance.now().
-  const payload = { env: document.getElementById('env').textContent, rows };
+  // Stamp the workload into the payload. Two runs with different
+  // parameters produce legitimately different step counts, and a
+  // collector that merges them reports nonsense — which is exactly what
+  // happened before this was here.
+  const payload = {
+    workload: { agents: AGENTS, tasks: TASKS, rounds: ROUNDS, perRound: PER_ROUND,
+                expectSteps: EXPECT_STEPS },
+    env: document.getElementById('env').textContent,
+    rows,
+  };
   try {
     await fetch('/__result?data=' + encodeURIComponent(JSON.stringify(payload)));
   } catch (_) { /* opened by hand, no collector listening */ }

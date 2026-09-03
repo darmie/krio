@@ -50,24 +50,50 @@ Chrome 152, 10 hardware threads, 96 tasks x 24 rounds:
 
 ```
 spawn() — shared injector, every agent pulls its own
- agents   wall (ms)   speedup  max concurrent   steals   steps per agent
-      1         230     1.00x               1        0   2400
-      2         120     1.91x               2        0   1200 1200
-      4          65     3.56x               4        0   600 600 600 600
-      8          45     5.14x               8        0   400 250 275 325 275 300 325 250
+  agents      ms   speedup  max conc  steals   steps      per agent
+       1     225     1.00x         1       0    2400 ✓    2400
+       2     116     1.94x         2       0    2400 ✓    1200 1200
+       4      63     3.58x         4       0    2400 ✓    650 600 550 600
+       8      42     5.39x         8       0    2400 ✓    425 300 225 275 350 250 275 300
 
 spawn_on(agent 0) — one agent owns it all; the rest must steal
-      1         228     1.00x               1        0   2400
-      2         119     1.91x               2       48   1200 1200
-      4          62     3.66x               4       72   600 600 600 600
-      8          41     5.58x               8       81   375 275 300 325 275 275 300 275
+       1     218     1.00x         1       0    2400 ✓    2400
+       2     112     1.95x         2      48    2400 ✓    1200 1200
+       4      62     3.51x         4      72    2400 ✓    600 600 600 600
+       8      36     6.11x         8      83    2400 ✓    325 275 275 300 300 300 300 325
 ```
 
-`max concurrent` is the overlap proof — agents inside `Task::step` at
-the same instant, counted by the observer rather than inferred from a
-clock. The two tables separate two things that look alike: the first
-balances through the injector and needs no steals at all, so only the
-second shows the deque doing its job.
+`max conc` is the overlap proof — agents inside `Task::step` at the same
+instant, counted by the observer rather than inferred from a clock.
+Trust it and `steals` over the speedup, which swings with whatever else
+the machine is doing.
+
+The two tables separate two things that look alike: the first balances
+through the injector and needs no steals at all, so only the second
+shows the deque doing its job.
+
+### It also proves the memory is shared
+
+Worth spelling out, because a demo that quietly ran on eight separate
+address spaces would look much the same:
+
+* **steals > 0** — a steal is one agent CAS-ing *another agent's* deque.
+* **max conc 8** — one `AtomicUsize`, incremented by eight Workers
+  before any of them decremented it.
+* **steps totalling 2400** — per-agent counters written by Workers and
+  read by the main thread. Unshared, it would see its own and seven
+  zeros.
+
+The page also checks `crossOriginIsolated` and
+`memory.buffer instanceof SharedArrayBuffer` up front and refuses rather
+than degrading.
+
+### Every run checks itself
+
+A run must produce `tasks * (rounds + 1)` steps and reach
+`max conc == agents`. The page shows ✓ or ✗ per row, so a run that
+measured the wrong thing says so on the page instead of looking
+plausible in a summary later.
 
 ## Headless, without a WebDriver
 
@@ -76,12 +102,28 @@ reliable way to be blocked. The page reports its results back to
 `serve.py` instead, so a headless run needs no driver:
 
 ```sh
+python3 serve.py 8099 > /tmp/krio-results.txt &
+
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-  --headless=new --disable-gpu \
-  'http://127.0.0.1:8099/index.html?agents=4'
-# serve.py prints: RESULT {"env":...,"rows":...}
+  --headless=new --disable-gpu --user-data-dir=/tmp/krio-run \
+  'http://127.0.0.1:8099/index.html?agents=4&tasks=96&rounds=24&per_round=60000'
+# serve.py appends: RESULT {"workload":…,"rows":…}
+
+./report.py /tmp/krio-results.txt
 ```
 
-Avoid `--virtual-time-budget` for timing: it makes `performance.now()`
-meaningless while Workers burn real CPU, and reports wall times of zero.
-The counters stay correct because they are atomics, not clocks.
+Three things that cost real time to learn:
+
+* **Kill by profile, not by pid.** Killing the launcher leaves Chrome's
+  children running, and several live instances competing for CPU wreck
+  the timings. Launch each run with its own `--user-data-dir` and
+  `pkill -f` that path afterwards.
+* **Never `--virtual-time-budget` for timing.** It makes
+  `performance.now()` meaningless while Workers burn real CPU, and
+  reports wall times of zero. The counters stay correct — they are
+  atomics, not clocks.
+* **Group results by workload.** Two runs with different parameters
+  produce legitimately different step counts, and averaging across them
+  invents numbers: merging a 48x12 run into a 96x24 sweep once produced
+  a "41x speedup" that was one workload's clock over another's. Each
+  payload names its own workload and `report.py` groups on it.
