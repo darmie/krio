@@ -157,6 +157,28 @@ fn shutdown_wakes_agents_blocked_indefinitely() {
     }
 }
 
+/// A 64-bit counter on a 32-bit target: worth checking that it really
+/// is one atomic and not two halves a reader can catch mid-update.
+#[test]
+fn the_epoch_is_one_64_bit_atomic_not_two_halves() {
+    assert_eq!(
+        core::mem::align_of::<core::sync::atomic::AtomicU64>(),
+        8,
+        "wasm's i64.atomic.* traps on a misaligned address"
+    );
+
+    // Bits in both 32-bit halves. Under a torn write a reader could see
+    // the low half updated and the high half stale, or vice versa.
+    let spanning: u64 = 0x1_0000_0001;
+    publish_epoch_ms(spanning);
+    assert_eq!(krio_wasm::epoch_ms(), spanning);
+
+    // And a read-modify-write that carries across the halves.
+    let after = krio_wasm::advance_epoch_ms(0xFFFF_FFFF);
+    assert_eq!(after, spanning + 0xFFFF_FFFF);
+    assert_eq!(krio_wasm::epoch_ms(), after);
+}
+
 /// The epoch clock is a plain static, so every agent reads the same
 /// address — which is only true because workers share linear memory and
 /// do not re-run data-segment initialisation.

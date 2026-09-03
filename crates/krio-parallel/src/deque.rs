@@ -14,6 +14,25 @@
 //! the overflow — [`crate::injector::Injector`]. A full deque is a
 //! scheduling event, not an error.
 //!
+//! ## The index space is 32 bits on wasm
+//!
+//! `top` and `bottom` only ever count up, and `isize` is 32 bits on
+//! wasm32 — so the space they count through is ~2.1 billion operations,
+//! not the 9 quintillion a 64-bit host gets. A cluster pushes and pops
+//! once per yielded step, so that boundary is minutes of scheduling
+//! away, not geological time.
+//!
+//! Every index operation is therefore wrapping, and every comparison
+//! between `top` and `bottom` is made on their *difference* rather than
+//! on the indices themselves: once `bottom` has wrapped past
+//! `isize::MAX` and `top` has not, `top > bottom` is simply false. The
+//! difference stays correct because the live count can never approach
+//! half the index space — the deque is bounded, and small.
+//!
+//! Masking survives the wrap for free: capacity is a power of two, so
+//! `index & mask` takes the low bits and a negative index lands in
+//! range like any other.
+//!
 //! ## Slot ownership
 //!
 //! Slots are `MaybeUninit`, and a slot's contents are owned by whichever
@@ -71,7 +90,7 @@ impl<T> Deque<T> {
     pub(crate) fn len(&self) -> usize {
         let b = self.bottom.load(Ordering::Relaxed);
         let t = self.top.load(Ordering::Relaxed);
-        (b - t).max(0) as usize
+        b.wrapping_sub(t).max(0) as usize
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -90,7 +109,7 @@ impl<T> Deque<T> {
         let b = self.bottom.load(Ordering::Relaxed);
         let t = self.top.load(Ordering::Acquire);
 
-        if b - t >= self.capacity() as isize {
+        if b.wrapping_sub(t) >= self.capacity() as isize {
             return Err(value);
         }
 
@@ -100,7 +119,7 @@ impl<T> Deque<T> {
 
         // Publish the value before publishing the index that exposes it.
         fence(Ordering::Release);
-        self.bottom.store(b + 1, Ordering::Relaxed);
+        self.bottom.store(b.wrapping_add(1), Ordering::Relaxed);
         Ok(())
     }
 
@@ -110,7 +129,7 @@ impl<T> Deque<T> {
     /// # Safety
     /// Owner only.
     pub(crate) unsafe fn pop(&self) -> Option<T> {
-        let b = self.bottom.load(Ordering::Relaxed) - 1;
+        let b = self.bottom.load(Ordering::Relaxed).wrapping_sub(1);
         self.bottom.store(b, Ordering::Relaxed);
 
         // Claim the slot before reading `top`, and stop the two from
@@ -119,19 +138,24 @@ impl<T> Deque<T> {
 
         let t = self.top.load(Ordering::Relaxed);
 
-        if t > b {
+        // Compare the *difference*, never the indices. `t > b` is false
+        // once `b` has wrapped past isize::MAX and `t` has not, which on
+        // a 32-bit target is a few minutes of scheduling away.
+        let len = b.wrapping_sub(t);
+
+        if len < 0 {
             // Empty. Restore bottom to where it was.
-            self.bottom.store(b + 1, Ordering::Relaxed);
+            self.bottom.store(b.wrapping_add(1), Ordering::Relaxed);
             return None;
         }
 
-        if t == b {
+        if len == 0 {
             // Exactly one item, and a thief may be reaching for it.
             let won = self
                 .top
-                .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Relaxed)
+                .compare_exchange(t, t.wrapping_add(1), Ordering::SeqCst, Ordering::Relaxed)
                 .is_ok();
-            self.bottom.store(b + 1, Ordering::Relaxed);
+            self.bottom.store(b.wrapping_add(1), Ordering::Relaxed);
             return if won {
                 Some(unsafe { (*self.buf[(b & self.mask) as usize].get()).assume_init_read() })
             } else {
@@ -149,7 +173,7 @@ impl<T> Deque<T> {
         fence(Ordering::SeqCst);
         let b = self.bottom.load(Ordering::Acquire);
 
-        if t >= b {
+        if b.wrapping_sub(t) <= 0 {
             return None;
         }
 
@@ -160,7 +184,7 @@ impl<T> Deque<T> {
 
         if self
             .top
-            .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Relaxed)
+            .compare_exchange(t, t.wrapping_add(1), Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
         {
             Some(value)
@@ -180,10 +204,13 @@ impl<T> Drop for Deque<T> {
         // has no drop glue to get this wrong.
         let b = *self.bottom.get_mut();
         let t = *self.top.get_mut();
+        // Count, then step — `i < b` would stop immediately on a deque
+        // whose indices have wrapped, leaking every live task in it.
+        let live = b.wrapping_sub(t).max(0);
         let mut i = t;
-        while i < b {
+        for _ in 0..live {
             unsafe { (*self.buf[(i & self.mask) as usize].get()).assume_init_drop() };
-            i += 1;
+            i = i.wrapping_add(1);
         }
     }
 }
@@ -195,6 +222,36 @@ mod tests {
     use std::sync::Arc;
     use std::vec::Vec as StdVec;
     use std::{sync::atomic::AtomicBool as StdAtomicBool, thread};
+
+    /// `isize` is 32 bits on wasm32, so the index space is ~2.1 billion
+    /// operations rather than 9 quintillion. A busy cluster pushes and
+    /// pops once per yielded step, which reaches that in minutes, not
+    /// geological time — so the counters have to survive crossing it.
+    #[test]
+    fn indices_survive_crossing_the_top_of_the_index_space() {
+        let d: Deque<u64> = Deque::with_capacity(4);
+        let near_the_end = isize::MAX - 2;
+        d.top.store(near_the_end, Ordering::Relaxed);
+        d.bottom.store(near_the_end, Ordering::Relaxed);
+
+        unsafe {
+            d.push(1).unwrap();
+            d.push(2).unwrap();
+            // This one takes `bottom` past isize::MAX.
+            d.push(3).unwrap();
+        }
+        assert_eq!(d.len(), 3, "length must survive the wrap");
+
+        // A thief taking from the bottom of the range, an owner from the
+        // top — both index through the same wrapped counters.
+        assert_eq!(d.steal(), Some(1));
+        unsafe {
+            assert_eq!(d.pop(), Some(3));
+            assert_eq!(d.pop(), Some(2));
+            assert_eq!(d.pop(), None);
+        }
+        assert_eq!(d.len(), 0);
+    }
 
     #[test]
     fn push_pop_is_lifo() {
@@ -257,7 +314,14 @@ mod tests {
     #[test]
     fn concurrent_steal_loses_nothing_and_duplicates_nothing() {
         const N: u64 = 20_000;
-        let d: Arc<Deque<std::boxed::Box<u64>>> = Arc::new(Deque::with_capacity(64));
+        let d: Deque<std::boxed::Box<u64>> = Deque::with_capacity(64);
+        // Start just below the top of the index space so the run crosses
+        // it under real contention, not just in the single-threaded test
+        // above. On wasm32 that boundary is 2^31 operations away, which a
+        // scheduler reaches; here it is a store.
+        d.top.store(isize::MAX - 50, Ordering::Relaxed);
+        d.bottom.store(isize::MAX - 50, Ordering::Relaxed);
+        let d = Arc::new(d);
         let done = Arc::new(StdAtomicBool::new(false));
 
         let thieves: StdVec<_> = (0..3)

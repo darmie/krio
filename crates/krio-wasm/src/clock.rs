@@ -44,6 +44,23 @@ use krio_core::Clock;
 /// read by everyone.
 static EPOCH_MS: AtomicU64 = AtomicU64::new(0);
 
+// A 64-bit counter on a 32-bit target deserves a second look, and it
+// survives one: wasm32 reports `target_has_atomic = "64"`, so this is a
+// single `i64.atomic.*` instruction and no reader can see a torn half.
+// The address space is 32-bit; the atomics are not.
+//
+// The alignment matters more than it looks. wasm's atomic instructions
+// *trap* on a misaligned address rather than falling back to something
+// slower, so a target that aligned `u64` to 4 would turn every clock
+// read into a runtime trap. wasm32 aligns it to 8 and statics honour
+// that — asserted here so a future target that does not is a build
+// error rather than a trap in a browser.
+const _: () = assert!(
+    core::mem::align_of::<AtomicU64>() == 8,
+    "krio-wasm: the epoch clock needs a naturally aligned 64-bit atomic; \
+     wasm's i64.atomic.* traps on a misaligned address"
+);
+
 /// Reads the shared epoch counter.
 ///
 /// Zero-sized: the state is the static, not the instance, so handing one
