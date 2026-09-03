@@ -218,6 +218,7 @@ fn fresh_fiber_starts_with_fp_exceptions_masked() {
 // side measured through the identical call.
 
 #[inline(never)]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn sp_now() -> usize {
     let sp: usize;
     #[cfg(target_arch = "x86_64")]

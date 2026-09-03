@@ -122,5 +122,11 @@ jobs:
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "${{ matrix.target }}"
           rustup default "$RUST_TOOLCHAIN"
 
+      # --all-targets, not just the lib: the panic-stub path is easy to
+      # keep compiling while a test or bench that assumes a real context
+      # switch quietly breaks. `tests/abi.rs` did exactly that — an
+      # ungated `sp_now()` that only assigns its output under x86_64 or
+      # aarch64, so every other target failed to build the test binary
+      # while `cargo build` stayed green.
       - name: Build krio-fiber
-        run: cargo build -p krio-fiber --target "${{ matrix.target }}"
+        run: cargo build -p krio-fiber --all-targets --target "${{ matrix.target }}"
