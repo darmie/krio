@@ -190,6 +190,19 @@ jobs:
         run: |
           cargo test -p krio-parallel -p krio-wasm --target wasm32-wasip1-threads
 
+      # krio-fiber's own suites (abi, basic) build a real Fiber, so they
+      # are native-only by nature and are expected to panic here — the
+      # cross-compile job already checks they still *compile*. This is
+      # the part of krio-fiber that does mean something on wasm: yield
+      # points routing to a host suspender, and Fiber still refusing to
+      # pretend it exists.
+      - name: Run the host-suspension path
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime
+        run: |
+          rustup target add wasm32-wasip1
+          cargo test -p krio-fiber --target wasm32-wasip1 --test host_suspend
+
   # The main-thread rule — `memory.atomic.wait32` throws on a browser's
   # main thread, so `drive_once` must never park — is guarded portably by
   # krio-parallel's PoisonPark test, which fails in microseconds on any

@@ -545,6 +545,7 @@ impl Fiber {
 ///
 /// # Panics
 /// Panics if called outside of a fiber (i.e. from the host thread).
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows))))]
 pub fn yield_now() {
     let state_ptr = ACTIVE_TRAMPOLINE.with(|cell| cell.get());
     assert!(
@@ -697,6 +698,93 @@ pub fn is_deadline_passed() -> bool {
 /// "cooperative bail" check.
 pub fn should_yield_early() -> bool {
     is_cancelled() || is_deadline_passed()
+}
+
+// ── Host-routed suspension ────────────────────────────────────────
+
+/// Host-installed suspend function. Zero means "not installed";
+/// see `set_suspender`.
+///
+/// Only reachable on targets without a native context switch — a target
+/// that can switch its own stack has no use for a host suspend, and
+/// should not carry the indirection.
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
+static SUSPENDER: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the host's suspend operation, for targets that cannot
+/// switch their own stack.
+///
+/// A wasm module has no addressable stack and no instruction that moves
+/// between two, so [`Fiber`] itself is unavailable there — [`Fiber::new`]
+/// says so loudly rather than handing back something that looks like a
+/// fiber and is not. But *suspension* is a different question: the
+/// capability exists one level up, in the host — JS Promise Integration
+/// in a browser, `wasmtime`'s async support on a server, an explicit
+/// scheduler anywhere else — so [`yield_now`] routes there instead of
+/// switching.
+///
+/// That keeps code written against krio's free functions compiling and
+/// behaving on wasm, which matters because those calls are scattered
+/// through a language's standard library, far from any scheduler.
+///
+/// # What krio deliberately does not decide
+///
+/// There is more than one way for a host to make this suspend — engine
+/// suspension via JSPI, a worker per fiber over shared memory, an
+/// Asyncify transform — and they are not interchangeable. Which is
+/// right depends on where the module runs, which is the harness's
+/// knowledge rather than the program's. So the program marks the point
+/// at which it can be suspended and the host decides how.
+///
+/// # Invariant a host must not break
+///
+/// Never return from a suspension on a different instance, or with a
+/// different memory. Everything above the suspension point assumes its
+/// world is still there.
+///
+/// # Panics
+/// [`yield_now`] panics on these targets when nothing is installed. A
+/// suspend that silently does nothing would turn a yield point into a
+/// no-op and change what the program means; an unsupported operation
+/// should fail where it is unsupported.
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
+pub fn set_suspender(suspend: fn()) {
+    SUSPENDER.store(suspend as usize, Ordering::Release);
+}
+
+/// Is a host suspend operation installed?
+///
+/// Worth checking at start-up so a host can refuse deliberately instead
+/// of discovering it at the first yield point.
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
+pub fn has_suspender() -> bool {
+    SUSPENDER.load(Ordering::Acquire) != 0
+}
+
+/// Suspend the current computation, on a target with no native context
+/// switch.
+///
+/// Unlike the native [`yield_now`], this does not save a stack and
+/// return to a `resume` caller — there is no second stack to return to.
+/// It hands control to the host, which suspends the whole call if it
+/// can. From inside, this is a call that takes a while to return.
+///
+/// # Panics
+/// If no suspender is installed. See [`set_suspender`].
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
+pub fn yield_now() {
+    let installed = SUSPENDER.load(Ordering::Acquire);
+    assert!(
+        installed != 0,
+        "krio-fiber: yield_now() on a target with no native context switch, and no \
+         host suspender installed. Call krio_fiber::set_suspender() with the host's \
+         suspend operation (JSPI in a browser, wasmtime async on a server), or drive \
+         concurrency through the stackless krio-async path instead."
+    );
+    // SAFETY: only ever written by `set_suspender` from a `fn()`, and a
+    // function pointer stays valid for the life of the program.
+    let suspend: fn() = unsafe { core::mem::transmute(installed) };
+    suspend();
 }
 
 /// Host-installed time source, as a raw `fn() -> f64`. Zero means

@@ -52,7 +52,7 @@ tasks (per-fiber stack, but suspension Just Works).
 | `krio-core`      | ✅ shipped          |
 | `krio-runtime`   | ✅ shipped — RoundRobin scheduler |
 | `krio-stackless` | ✅ shipped — CooperativeExecutor + WakerExecutor |
-| `krio-fiber`     | ✅ shipped — Fiber on x86_64 (SysV + MS x64) + aarch64 (non-Windows) |
+| `krio-fiber`     | ✅ shipped — Fiber on x86_64 (SysV + MS x64) + aarch64 (non-Windows); host-routed `yield_now` elsewhere |
 | `krio-async`     | ✅ Phase 3 v2 — direct-yield + captures lift + cross-fn dispatch + multi-suspension blocks |
 | `krio-preempt`   | 🟨 v1 — TimeSliceScheduler (cooperative slicing); real signal preempt deferred |
 | `krio-parallel`  | 🟨 v1 — Cluster: bounded Chase–Lev deques, injector overflow, role-derived budgets, waker registry. Needs a `Park` backend per target |
@@ -78,9 +78,6 @@ shared vocabulary in `krio-core` is small on purpose — it's enough
 that mixing variants in one program doesn't require translation
 shims, but it doesn't pretend the implementations are interchangeable.
 
-## License
-
-MIT OR Apache-2.0 (see [LICENSE](LICENSE)).
 
 ## Running across threads or Web Workers
 
@@ -186,3 +183,48 @@ The whole path is exercised on a real engine, not just compiled:
 runs four agents over one shared linear memory, including an agent
 parked indefinitely on `atomic.wait32` and woken by another agent's
 `notify`.
+
+### Fibers on WebAssembly
+
+`Fiber` is **not** available on wasm, and says so rather than pretending:
+
+```text
+krio-fiber: native fibers are unavailable on this target
+```
+
+A wasm module has no addressable stack and no instruction that moves
+between two, so there is nothing to switch. That stays true until the
+stack-switching proposal ships (it is Phase 3).
+
+Suspension is a different question, and it *is* available. The
+capability exists one level up in the host — JSPI in a browser (Chrome
+137+, Firefox 153+, Safari 27 beta), `wasmtime`'s async support on a
+server, an explicit scheduler anywhere else — so `yield_now()` routes
+there instead of switching:
+
+```rust
+krio_fiber::set_suspender(|| host_suspend());   // wasm targets only
+```
+
+That keeps library code written against krio's free functions —
+`yield_now`, `should_yield_early`, `is_cancelled` — compiling and
+behaving on wasm, which matters because those calls are scattered
+through a language's standard library, far from any scheduler.
+
+Without a suspender installed, `yield_now()` panics. A suspend that
+silently did nothing would turn a yield point into a no-op and change
+what the program means.
+
+**krio deliberately does not choose how.** There are three ways a host
+can make that call suspend — engine suspension via JSPI, a worker per
+fiber over shared memory, an Asyncify transform — and they are not
+interchangeable. Which is right depends on where the module runs, which
+is the harness's knowledge rather than the program's. So the program
+marks the point at which it can be suspended, and the host decides how.
+
+One invariant a host must not break: never return from a suspension on a
+different instance, or with a different memory.
+
+## License
+
+MIT OR Apache-2.0 (see [LICENSE](LICENSE)).

@@ -82,3 +82,10 @@ pub use fiber::{
     is_deadline_passed, now_ms, set_clock, should_yield_early, take_input, take_input_u64,
     yield_now, yield_u64, yield_value,
 };
+
+// Only exist where there is no native context switch — see the module
+// docs on `set_suspender`. Re-exported separately so the symbol simply
+// does not appear on a target that switches its own stack, rather than
+// appearing and panicking.
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
+pub use fiber::{has_suspender, set_suspender};

@@ -49,6 +49,44 @@
 //! later, and the family already prefers an honest failure to a
 //! plausible wrong answer.
 //!
+//! ## Driving the cluster from the main thread
+//!
+//! A worker calls `run()` and blocks; the main thread cannot. It drives
+//! one bounded pass and returns to the event loop, then needs waking
+//! when work appears. `Atomics.waitAsync` does that against the *same*
+//! parking slot a worker would block on, which is why a waker only ever
+//! issues one `notify` and never branches on who it is waking.
+//!
+//! ```js
+//! const slots = new Int32Array(memory.buffer);
+//! const PARKED = 1;
+//!
+//! function pump() {
+//!   // One bounded pass. Returns Idle (0) when there was nothing to do.
+//!   const drove = exports.krio_drive_main();
+//!   if (drove !== 0) {
+//!     // Still work: yield to the event loop, then come straight back
+//!     // so rendering and input get a turn between passes.
+//!     queueMicrotask(pump);
+//!     return;
+//!   }
+//!   // Genuinely idle. Wait on the slot instead of polling — this is
+//!   // the non-blocking twin of memory.atomic.wait32, and the only
+//!   // form of waiting the main thread is allowed.
+//!   const idx = exports.krio_park_slot_addr(0) >>> 2;
+//!   const w = Atomics.waitAsync(slots, idx, PARKED);
+//!   (w.async ? w.value : Promise.resolve()).then(pump);
+//! }
+//! ```
+//!
+//! The Rust side is three exports over
+//! [`krio_parallel::Cluster`]: `drive_once(AgentId(0), AgentRole::Main)`,
+//! [`krio_parallel::Cluster::park_slot_addr`], and whatever the host
+//! spawns work through. Note `Atomics.waitAsync` returns
+//! `{async: false}` when the value already differs — work landed while
+//! the pass was ending — so the `w.async` branch is what stops a wake
+//! being missed at exactly the moment it matters.
+//!
 //! ## Putting it together
 //!
 //! Not compiled as a doctest: `WasmPark` only implements `Park` on a

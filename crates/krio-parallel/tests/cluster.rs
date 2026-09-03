@@ -575,3 +575,31 @@ fn a_wake_reaches_an_agent_that_has_gone_to_sleep() {
     cluster.shutdown();
     worker.join().unwrap();
 }
+
+#[test]
+fn park_slots_are_addressable_aligned_and_distinct() {
+    let cluster = Cluster::new(4, SpinPark::default(), StdClock::new());
+
+    let addrs: Vec<usize> = (0..4).map(|i| cluster.park_slot_addr(AgentId(i))).collect();
+
+    for (i, &a) in addrs.iter().enumerate() {
+        let id = AgentId(i as u32);
+        // Atomics.waitAsync and memory.atomic.wait32 both throw on a
+        // misaligned address rather than tolerating one.
+        assert_eq!(a % 4, 0, "agent {i} slot is not four-byte aligned");
+        // Stable: a host hands this to JS once at start-up.
+        assert_eq!(a, cluster.park_slot_addr(id));
+    }
+
+    // Distinct, and far enough apart not to share a cache line — two
+    // agents spinning on one line is measurable false sharing.
+    for i in 0..addrs.len() {
+        for j in (i + 1)..addrs.len() {
+            let gap = addrs[i].abs_diff(addrs[j]);
+            assert!(
+                gap >= 64,
+                "agents {i} and {j} share a cache line (gap {gap})"
+            );
+        }
+    }
+}

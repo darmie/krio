@@ -293,6 +293,38 @@ impl<P: Park, C: Clock + Sync> Cluster<P, C> {
         }
     }
 
+    /// Address of `agent`'s parking slot, for a host that has to wait
+    /// on it from outside wasm.
+    ///
+    /// A worker parks with `memory.atomic.wait32` and needs nothing from
+    /// the host. The main agent cannot — that instruction throws on a
+    /// browser's main thread — so it waits on the JS side instead, with
+    /// `Atomics.waitAsync` against *this* address. Same slot, same
+    /// protocol, so a waker still issues one `notify` and never has to
+    /// know which kind of agent it is waking.
+    ///
+    /// The value is a byte offset into the module's linear memory, which
+    /// is what `WebAssembly.Memory.buffer` is indexed by. Divide by four
+    /// for an `Int32Array` index:
+    ///
+    /// ```js
+    /// const slots = new Int32Array(memory.buffer);
+    /// const idx = cluster_park_slot_addr(0) >>> 2;   // PARKED === 1
+    /// Atomics.waitAsync(slots, idx, 1).value.then(() => drive());
+    /// ```
+    ///
+    /// Stable for the life of the cluster. Always four-byte aligned,
+    /// which both `Atomics.waitAsync` and `memory.atomic.wait32`
+    /// require — they throw rather than tolerate a misaligned address.
+    ///
+    /// # Panics
+    /// If `agent` is out of range.
+    pub fn park_slot_addr(&self, agent: AgentId) -> usize {
+        let i = agent.0 as usize;
+        assert!(i < self.agents.len(), "agent {} out of range", agent.0);
+        &self.agents[i].park_state as *const AtomicU32 as usize
+    }
+
     /// How many tasks are waiting on a [`Cluster::wake`].
     ///
     /// Parked tasks are deliberately not counted by
