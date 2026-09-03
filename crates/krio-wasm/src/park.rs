@@ -102,6 +102,18 @@ impl Park for WasmPark {
             core::arch::wasm32::memory_atomic_notify(slot.as_ptr() as *mut i32, 1);
         }
     }
+
+    fn unpark_all(&self, slot: &AtomicU32) {
+        // The safepoint barrier: every agent waits on one address and
+        // all of them go at once. `u32::MAX` is the instruction's own
+        // "wake everybody" — waking them singly would need a count
+        // nobody has.
+        //
+        // SAFETY: as above.
+        unsafe {
+            core::arch::wasm32::memory_atomic_notify(slot.as_ptr() as *mut i32, u32::MAX);
+        }
+    }
 }
 
 #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]

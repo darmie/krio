@@ -60,6 +60,7 @@ mod injector;
 mod observer;
 mod park;
 mod parked;
+mod safepoint;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -72,6 +73,7 @@ use krio_runtime::{AgentId, AgentRole, Budget, Drive, ParallelScheduler};
 use deque::Deque;
 use injector::Injector;
 use parked::Parked;
+use safepoint::Safepoint;
 
 pub use observer::TaskObserver;
 pub use park::{NOTIFIED, PARKED, Park, RUNNING, SpinPark};
@@ -112,6 +114,8 @@ pub struct Cluster<P: Park, C: Clock + Sync> {
     /// out of the run queues so an agent can genuinely sleep instead of
     /// polling a channel that cannot have changed.
     parked: Parked<Job>,
+    /// Stop-the-world rendezvous. See [`Cluster::stop_the_world`].
+    safepoint: Safepoint,
     parker: P,
     clock: C,
     stopping: AtomicBool,
@@ -149,6 +153,7 @@ impl<P: Park, C: Clock + Sync> Cluster<P, C> {
             agents: agents.into_boxed_slice(),
             injector: Injector::new(),
             parked: Parked::new(),
+            safepoint: Safepoint::new(),
             parker,
             clock,
             stopping: AtomicBool::new(false),
@@ -334,6 +339,111 @@ impl<P: Park, C: Clock + Sync> Cluster<P, C> {
         self.parked.len()
     }
 
+    // ── Stop the world ────────────────────────────────────────────
+
+    /// Is a stop-the-world pending? **The hot-loop poll.**
+    ///
+    /// One relaxed load of a shared flag — a load and a predictable
+    /// branch. A task whose `step` runs for milliseconds (a game loop, a
+    /// physics tick) must call this at its loop back-edges and
+    /// [`Cluster::enter_safepoint`] when it returns true, or a collection
+    /// cannot begin until that loop finishes.
+    ///
+    /// Tasks made of many short steps need nothing: the scheduler checks
+    /// between steps on their behalf.
+    ///
+    /// wasm has no signals and no way to suspend another agent's stack,
+    /// so a poll is not one option among several — it is the only way to
+    /// bound time-to-safepoint. HotSpot and Go reach the same answer.
+    #[inline]
+    pub fn safepoint_requested(&self) -> bool {
+        self.safepoint.requested()
+    }
+
+    /// Stop here and count as safe until the world resumes.
+    ///
+    /// Call only when [`Cluster::safepoint_requested`] is true, and only
+    /// where the host's own invariants hold — that is what makes the
+    /// point *safe*. Blocks, so worker agents only.
+    pub fn enter_safepoint(&self) {
+        self.safepoint.enter(&self.parker);
+    }
+
+    /// Stop every other agent, run `f`, then let them go.
+    ///
+    /// The collection window: while `f` runs, no other agent is inside
+    /// `Task::step`, so the heap is not being mutated. krio takes no view
+    /// on what `f` does — it does not know what a root is.
+    ///
+    /// Blocks, so worker agents only. A browser main thread uses
+    /// [`Cluster::request_safepoint`] and polls
+    /// [`Cluster::world_is_stopped`] instead.
+    ///
+    /// Returns `None` without running `f` if another stop is already in
+    /// progress, or if the cluster shut down while waiting — two hosts
+    /// must never both believe they own the world.
+    ///
+    /// # Panics
+    /// If `requester` is out of range. It names the agent that will be
+    /// running `f`, and it is excluded from the agents waited on — pass
+    /// the wrong one and the barrier waits for an agent that is standing
+    /// still.
+    ///
+    /// # Hangs
+    /// Waits indefinitely for an agent stuck in a long `step` that never
+    /// polls. That is a pause, which is diagnosable; the alternative
+    /// would be scanning a heap somebody is still writing to.
+    pub fn stop_the_world<R>(&self, requester: AgentId, f: impl FnOnce() -> R) -> Option<R> {
+        assert!(
+            (requester.0 as usize) < self.agents.len(),
+            "agent {} out of range",
+            requester.0
+        );
+        if !self.safepoint.request() {
+            return None;
+        }
+        // Wake the sleepers: an idle agent is not mutating, but it has to
+        // arrive and say so, and it must not take work again until the
+        // world resumes.
+        for a in self.agents.iter() {
+            self.parker.unpark_all(&a.park_state);
+        }
+        // Everyone but the requester, which is by definition safe.
+        let others = self.agents.len().saturating_sub(1) as u32;
+        let arrived = self
+            .safepoint
+            .await_all(others, &self.stopping, &self.parker);
+        let result = if arrived { Some(f()) } else { None };
+        self.safepoint.release(&self.parker, &self.stopping);
+        result
+    }
+
+    /// Ask for a stop without waiting for it.
+    ///
+    /// For an agent that may not block. Poll [`Cluster::world_is_stopped`],
+    /// do the work, then call [`Cluster::resume_world`].
+    ///
+    /// Returns `false` if a stop was already pending.
+    pub fn request_safepoint(&self) -> bool {
+        if !self.safepoint.request() {
+            return false;
+        }
+        for a in self.agents.iter() {
+            self.parker.unpark_all(&a.park_state);
+        }
+        true
+    }
+
+    /// Have all the other agents arrived at the barrier?
+    pub fn world_is_stopped(&self) -> bool {
+        self.safepoint.stopped_count() >= self.agents.len().saturating_sub(1) as u32
+    }
+
+    /// Release a stop taken with [`Cluster::request_safepoint`].
+    pub fn resume_world(&self) {
+        self.safepoint.release(&self.parker, &self.stopping);
+    }
+
     /// Move one agent out of `PARKED` and wake it. Does not disturb
     /// agents that are already running.
     fn notify_one(&self) {
@@ -424,6 +534,20 @@ impl<P: Park, C: Clock + Sync> ParallelScheduler for Cluster<P, C> {
                 return Drive::ShuttingDown;
             }
 
+            // Between steps is a safe point by construction: no task is
+            // executing. Checking here is what lets a task made of many
+            // short steps cost its author nothing.
+            //
+            // A main agent must not block, so it leaves instead and its
+            // host resumes driving once the world does.
+            if self.safepoint.requested() {
+                if role == AgentRole::Worker {
+                    self.safepoint.enter(&self.parker);
+                } else {
+                    break;
+                }
+            }
+
             if let Some(deadline) = deadline {
                 if self.clock.now_ms() >= deadline {
                     break;
@@ -444,6 +568,16 @@ impl<P: Park, C: Clock + Sync> ParallelScheduler for Cluster<P, C> {
         let slot = &self.agents[i].park_state;
 
         loop {
+            // Before anything else, including before deciding there is no
+            // work. An idle agent is not mutating, but the barrier counts
+            // arrivals, so it still has to turn up and say so — otherwise
+            // a stop-the-world waits forever on an agent that is asleep
+            // and harmless.
+            if self.safepoint.requested() {
+                self.safepoint.enter(&self.parker);
+                continue;
+            }
+
             match self.drive_once(agent, AgentRole::Worker) {
                 Drive::ShuttingDown => return,
                 Drive::Ran(_) => continue,
@@ -484,6 +618,10 @@ impl<P: Park, C: Clock + Sync> ParallelScheduler for Cluster<P, C> {
 
     fn shutdown(&self) {
         self.stopping.store(true, Ordering::Release);
+        // Agents waiting at a safepoint are parked on the generation, not
+        // on their own slot, so the notifications below would miss them
+        // entirely and their `run` would never return.
+        self.safepoint.release(&self.parker, &self.stopping);
         // Wake everyone, parked or not: an agent that is mid-pass will
         // see `stopping` on its next check, and one that is asleep needs
         // the notification to get there at all.

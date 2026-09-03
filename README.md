@@ -55,7 +55,7 @@ tasks (per-fiber stack, but suspension Just Works).
 | `krio-fiber`     | ✅ shipped — Fiber on x86_64 (SysV + MS x64) + aarch64 (non-Windows); host-routed `yield_now` elsewhere |
 | `krio-async`     | ✅ Phase 3 v2 — direct-yield + captures lift + cross-fn dispatch + multi-suspension blocks |
 | `krio-preempt`   | 🟨 v1 — TimeSliceScheduler (cooperative slicing); real signal preempt deferred |
-| `krio-parallel`  | 🟨 v1 — Cluster: bounded Chase–Lev deques, injector overflow, role-derived budgets, waker registry. Needs a `Park` backend per target |
+| `krio-parallel`  | 🟨 v1 — Cluster: bounded Chase–Lev deques, injector overflow, role-derived budgets, waker registry, stop-the-world safepoints. Needs a `Park` backend per target |
 | `krio-wasm`      | 🟨 v1 — shared-memory parking, epoch clock, agent-spawn hook. Verified on wasm under wasmtime; browser harness not yet written |
 
 ## Tradeoffs at a glance
@@ -228,3 +228,42 @@ different instance, or with a different memory.
 ## License
 
 MIT OR Apache-2.0 (see [LICENSE](LICENSE)).
+
+### Stopping the world
+
+A collector needs every agent stopped somewhere safe before it can scan,
+and only the scheduler knows where those points are:
+
+```rust
+cluster.stop_the_world(AgentId(0), || collector.collect());
+```
+
+krio takes no view on what happens inside — it does not know what a root
+is. It only guarantees that while the closure runs, no other agent is
+inside `Task::step`.
+
+Agents reach the barrier three ways. Between steps the scheduler checks
+on their behalf, so a task made of many short steps costs its author
+nothing. An idle agent is woken to report in — it is not mutating, but
+the barrier counts arrivals. The third is the hard one.
+
+**Hot loops.** A game loop or physics tick is one `step` that runs for
+milliseconds and never returns to the scheduler. wasm has no signals and
+no way to suspend another agent's stack, so nothing can interrupt it —
+the loop has to ask, which is the answer HotSpot and Go reach too:
+
+```rust
+while running {
+    if cluster.safepoint_requested() {   // one relaxed load
+        cluster.enter_safepoint();
+    }
+    ...
+}
+```
+
+A host that never polls corrupts nothing; it just cannot be collected
+until that loop finishes, and `stop_the_world` waits. A pause is
+diagnosable, a torn heap is not.
+
+The browser main thread cannot block, so it uses `request_safepoint()`,
+polls `world_is_stopped()`, and calls `resume_world()` when finished.
