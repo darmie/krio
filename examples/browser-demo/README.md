@@ -127,3 +127,33 @@ Three things that cost real time to learn:
   invents numbers: merging a 48x12 run into a 96x24 sweep once produced
   a "41x speedup" that was one workload's clock over another's. Each
   payload names its own workload and `report.py` groups on it.
+
+## The spawner must never block
+
+`?nested=1` runs the arrangement a language runtime needs: agent 1
+decides who else exists, rather than the page deciding up front. It is
+what `Thread.create` looks like when the runtime's own main thread lives
+on a Worker.
+
+It only works because the request is **proxied to the page**. A
+dedicated Worker's children start through its parent's event loop, so an
+agent that calls `new Worker()` and then blocks in `run()` leaves its
+child permanently unstarted. Measured in Chrome 152:
+
+```
+parent spawns child, then blocks    -> child never runs
+parent spawns child, stays awake    -> child runs
+parent asks the page, then blocks   -> child runs
+```
+
+For a runtime this is the common path, not an edge case —
+`Thread.create` followed by a join or a mutex acquire is ordinary code.
+So `worker.js` posts `{ pleaseSpawn: [...] }` and the page obliges,
+because the page is the one agent that never blocks.
+
+Both arrangements reach the same place:
+
+```
+page spawns all          agents=8 maxconc=8 steals=82 steps=2400 ok
+agent 1 asks the page    agents=8 maxconc=8 steals=80 steps=2400 ok
+```

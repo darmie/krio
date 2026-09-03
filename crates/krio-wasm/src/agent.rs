@@ -36,14 +36,45 @@
 //! });
 //! ```
 //!
-//! Two invariants a host must not break, both of which produce silent
-//! corruption rather than a clean failure:
+//! Three invariants a host must not break. The first two produce silent
+//! corruption rather than a clean failure; the third produces a hang.
 //!
 //! * the worker instantiates the **same module** against the **same
 //!   memory** — a suspension must never resume on a different instance;
 //! * the worker does **not** re-run data-segment initialisation, or it
 //!   resets every shared static (the epoch clock included) under the
-//!   agents already running.
+//!   agents already running;
+//! * **the spawner must be an agent that never blocks.**
+//!
+//! ## Why the spawner cannot be a worker
+//!
+//! A dedicated Worker's children are started through its *parent's*
+//! event loop. An agent that calls `new Worker()` and then enters
+//! [`krio_parallel::ParallelScheduler::run`] blocks in
+//! `memory.atomic.wait32` — and its child never starts at all. Measured
+//! in Chrome 152, not inferred:
+//!
+//! ```text
+//! parent spawns child, then blocks   -> child never runs
+//! parent spawns child, stays awake   -> child runs
+//! parent asks the page to spawn,
+//!   then blocks                      -> child runs
+//! ```
+//!
+//! For a language runtime this is not an edge case, it is the common
+//! path. `Thread.create` followed by a join, a mutex acquire, or a
+//! condition wait is ordinary code, and doing it from a worker-hosted
+//! main thread would deadlock on the first one.
+//!
+//! So a hook installed on an agent that may block must **delegate**:
+//! post to the page and let it call `new Worker()`. The page never
+//! blocks — that is precisely what makes it the main agent — so it can
+//! always oblige.
+//!
+//! This is the strongest argument for the hook over a declared import.
+//! A fixed import would have to name one way of starting an agent; the
+//! right way depends on *which agent is asking*, and only the host knows
+//! who is safe to ask.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 

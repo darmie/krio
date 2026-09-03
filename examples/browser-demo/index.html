@@ -24,6 +24,9 @@ const AGENTS    = +(params.get('agents')    ?? 4);
 const TASKS     = +(params.get('tasks')     ?? 48);
 const ROUNDS    = +(params.get('rounds')    ?? 12);
 const PER_ROUND = +(params.get('per_round') ?? 20000);
+// ?nested=1 — the page starts ONE Worker and that Worker starts the rest,
+// which is how a runtime whose own main thread is a Worker would do it.
+const NESTED    = params.get('nested') === '1';
 
 const status = document.getElementById('status');
 const out = document.getElementById('out');
@@ -72,14 +75,44 @@ async function main() {
 
   // Agents 1..N-1 are Workers. Agent 0 is this thread, which must never
   // block, so it drives with `drive_main()` instead of `run()`.
-  const ready = [];
-  for (let a = 1; a < AGENTS; a++) {
+  const want = AGENTS - 1;
+  const seen = new Set();
+  let allUp;
+  const upped = new Promise(res => { allUp = res; });
+  const note = (d) => { if (d && d.ready !== undefined) { seen.add(d.ready);
+                        if (seen.size >= want) allUp(); } };
+
+  // Listen on the channel too: a nested Worker's children cannot report
+  // through their parent once it blocks (see worker.js).
+  const chan = new BroadcastChannel('krio-ready');
+  chan.onmessage = (m) => note(m.data);
+
+  const startWorker = (agent, alsoSpawn) => {
     const w = new Worker('./worker.js', { type: 'module' });
-    ready.push(new Promise(res => w.onmessage = () => res()));
-    w.postMessage({ module, memory, agent: a });
+    w.onmessage = (m) => {
+      // A blocked Worker cannot start its own children, so it delegates
+      // here. The page never blocks, so it always can.
+      if (m.data.pleaseSpawn) {
+        for (const child of m.data.pleaseSpawn) startWorker(child);
+        return;
+      }
+      note(m.data);
+    };
+    w.postMessage({ module, memory, agent, alsoSpawn });
+  };
+
+  if (NESTED && want > 0) {
+    // Agent 1 decides who else exists — the shape a runtime has when its
+    // own main thread is a Worker and user code calls Thread.create.
+    const rest = [];
+    for (let a = 2; a < AGENTS; a++) rest.push(a);
+    startWorker(1, rest);
+  } else {
+    for (let a = 1; a < AGENTS; a++) startWorker(a);
   }
-  await Promise.all(ready);
-  say(`${AGENTS - 1} workers up; running…`);
+  if (want > 0) await upped;
+  chan.close();
+  say(`${want} workers up${NESTED ? ' (nested)' : ''}; running…`);
 
   const rows = { injector: [], stolen: [] };
 
@@ -125,7 +158,7 @@ async function main() {
   // happened before this was here.
   const payload = {
     workload: { agents: AGENTS, tasks: TASKS, rounds: ROUNDS, perRound: PER_ROUND,
-                expectSteps: EXPECT_STEPS },
+                expectSteps: EXPECT_STEPS, nested: NESTED },
     env: document.getElementById('env').textContent,
     rows,
   };
