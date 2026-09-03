@@ -111,3 +111,50 @@ pub trait Task {
 /// Cranelift IR, Rust MIR) satisfies this naturally.
 pub trait CfgId: Copy + Eq + Ord + Hash + Debug {}
 impl<T: Copy + Eq + Ord + Hash + Debug> CfgId for T {}
+
+/// Monotonic millisecond source.
+///
+/// Deadline polling sits on the hot path — a cooperative coroutine is
+/// expected to call `should_yield_early()` at every checkpoint — so an
+/// implementation should be a *load*, not a syscall and certainly not a
+/// foreign-function call. On a target with shared memory the intended
+/// shape is a counter one agent bumps and every other agent reads
+/// relaxed; on a native target `SystemTime` is fine.
+///
+/// The origin is unspecified. Only differences between two readings on
+/// the same `Clock` are meaningful.
+///
+/// # Why this is vocabulary rather than a scheduler detail
+/// Both `krio-fiber` (per-fiber deadlines) and `krio-preempt` (time
+/// slices) need a clock, and a host mixing the two must be able to give
+/// them the *same* one — otherwise a fiber's deadline and the slice that
+/// set it are measured against different origins. That makes it shared
+/// vocabulary, which is what this crate is for.
+pub trait Clock {
+    /// Milliseconds since this clock's own origin.
+    fn now_ms(&self) -> f64;
+}
+
+/// Process-unique identity for a [`Task`], stable across a migration
+/// between execution agents.
+///
+/// krio does not interpret the value. It exists so a host can key its
+/// own state — a shadow call stack, a GC root table, a profiler span —
+/// to a task it does not own and cannot look inside, and still follow
+/// that task when a scheduler moves it to another agent.
+///
+/// Id `0` is reserved for "no task" / the scheduler's own context, so a
+/// host can use it as a sentinel the way `krio-fiber` uses fiber id 0
+/// for the scheduler context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskId(pub u64);
+
+impl TaskId {
+    /// The scheduler / host context — never a real task.
+    pub const NONE: TaskId = TaskId(0);
+
+    /// Is this a real task rather than the [`TaskId::NONE`] sentinel?
+    pub fn is_task(self) -> bool {
+        self.0 != 0
+    }
+}
