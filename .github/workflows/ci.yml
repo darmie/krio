@@ -130,3 +130,12 @@ jobs:
       # while `cargo build` stayed green.
       - name: Build krio-fiber
         run: cargo build -p krio-fiber --all-targets --target "${{ matrix.target }}"
+
+      # The portable half of the family has to keep working on wasm, and
+      # krio-parallel is the crate that will grow a shared-memory
+      # backend, so it is worth gating now rather than after it drifts.
+      - name: Build portable crates
+        run: |
+          cargo build --all-targets --target "${{ matrix.target }}" \
+            -p krio-core -p krio-runtime -p krio-stackless \
+            -p krio-async -p krio-parallel

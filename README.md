@@ -22,7 +22,9 @@ krio
 │                       transform (function-colour + frame stack)
 ├── krio-fiber        — Wren/Lua-style stackful runtime
 │                       (Fiber implements krio-core::Task)
-└── krio-preempt      — preemptive scheduler (planned)
+├── krio-preempt      — preemptive scheduler (planned)
+└── krio-parallel     — work stealing across agents sharing one
+                        address space (threads / Web Workers)
 ```
 
 ## Picking a variant
@@ -33,6 +35,7 @@ krio
 | `async fn` / `suspend fun` style with function colour        | `krio-async`       |
 | First-class fibers, yield from any depth, simple programmer model | `krio-fiber`       |
 | Forced timeslicing — fibers can't starve each other          | `krio-preempt`     |
+| Tasks spread over OS threads or Web Workers                  | `krio-parallel`    |
 
 The variants are not mutually exclusive — most languages ship two or
 three. A microkernel might use `krio-stackless` for the hot path
@@ -49,6 +52,7 @@ tasks (per-fiber stack, but suspension Just Works).
 | `krio-fiber`     | ✅ shipped — Fiber on x86_64 (SysV + MS x64) + aarch64 (non-Windows) |
 | `krio-async`     | ✅ Phase 3 v2 — direct-yield + captures lift + cross-fn dispatch + multi-suspension blocks |
 | `krio-preempt`   | 🟨 v1 — TimeSliceScheduler (cooperative slicing); real signal preempt deferred |
+| `krio-parallel`  | 🟨 v1 — Cluster: bounded Chase–Lev deques, injector overflow, role-derived budgets. Needs a `Park` backend per target |
 
 ## Tradeoffs at a glance
 
@@ -73,3 +77,51 @@ shims, but it doesn't pretend the implementations are interchangeable.
 ## License
 
 MIT OR Apache-2.0 (see [LICENSE](LICENSE)).
+
+## Running across threads or Web Workers
+
+`krio-parallel` drives `Task`s on a **cluster** of agents sharing one
+address space — OS threads natively, Web Workers in a browser built
+with `+atomics`.
+
+The currency is `Box<dyn Task + Send>`, and that bound is the whole
+safety argument. Under `+atomics` a Web Worker *is* a thread as far as
+the type system is concerned: thread-locals are per-instance, statics
+are shared. So `Send` already means exactly "may be handed to another
+agent", and no new marker trait is needed to say it.
+
+The consequence lands where it should. A `krio_fiber::Fiber` holds a raw
+pointer, so it is `!Send`, so it cannot be spawned onto a cluster at all:
+
+```text
+error[E0277]: `*mut c_void` cannot be sent between threads safely
+```
+
+That is correct rather than unfortunate — a suspended stack is not
+relocatable. Balance fibers by *placement* instead, before creation:
+pick the least-loaded agent and build the fiber there.
+
+Agents are not symmetric, and the API says so. `run()` parks when idle
+and belongs to a worker; `drive_once()` never parks and is the only
+entry point a browser's main thread may use, because
+`memory.atomic.wait32` throws there. How long a pass runs comes from
+`AgentRole` rather than a setting — the value that decides how an agent
+waits also decides how long it runs, so a host cannot starve a UI thread
+by forgetting to configure something.
+
+### Clocks on targets that don't have one
+
+`SystemTime::now()` traps on `wasm32-unknown-unknown` with *time not
+implemented on this platform*. `krio-fiber` therefore reads its
+deadlines through an installable clock, and `krio-preempt` reads
+`krio_fiber::now_ms()` rather than keeping one of its own — so a slice
+and the deadline it sets are always measured against the same origin:
+
+```rust
+static EPOCH_MS: AtomicU64 = AtomicU64::new(0);   // bumped by one agent
+krio_fiber::set_clock(|| EPOCH_MS.load(Ordering::Relaxed) as f64);
+```
+
+A deadline check is then one relaxed load from shared memory — no
+syscall, and no crossing into JS on a path a coroutine polls in its hot
+loop.
