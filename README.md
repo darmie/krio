@@ -225,9 +225,6 @@ marks the point at which it can be suspended, and the host decides how.
 One invariant a host must not break: never return from a suspension on a
 different instance, or with a different memory.
 
-## License
-
-MIT OR Apache-2.0 (see [LICENSE](LICENSE)).
 
 ### Stopping the world
 
@@ -267,3 +264,10 @@ diagnosable, a torn heap is not.
 
 The browser main thread cannot block, so it uses `request_safepoint()`,
 polls `world_is_stopped()`, and calls `resume_world()` when finished.
+
+
+
+
+## License
+
+MIT OR Apache-2.0 (see [LICENSE](LICENSE)).
