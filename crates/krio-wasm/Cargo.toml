@@ -12,6 +12,12 @@ krio-runtime = { workspace = true }
 krio-parallel = { workspace = true }
 krio-fiber = { workspace = true, optional = true }
 
+# Browser-only. Narrower than `cfg(target_arch = "wasm32")` on purpose:
+# wasm32-wasip1-threads is a wasm target too, and drives its tests
+# through wasmtime rather than a browser.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
 [features]
 default = []
 # Wire the epoch clock into krio-fiber's global deadline clock. Off by

@@ -189,3 +189,47 @@ jobs:
           CARGO_TARGET_WASM32_WASIP1_THREADS_RUNNER: wasmtime -W threads=y -W shared-memory=y -S threads=y
         run: |
           cargo test -p krio-parallel -p krio-wasm --target wasm32-wasip1-threads
+
+  # The main-thread rule — `memory.atomic.wait32` throws on a browser's
+  # main thread, so `drive_once` must never park — is guarded portably by
+  # krio-parallel's PoisonPark test, which fails in microseconds on any
+  # target if someone adds a park to that path. This job checks the other
+  # half, which no unit test can: that the whole shared-memory build
+  # recipe actually instantiates and runs in a real engine — atomics,
+  # -Zbuild-std, cross-origin isolation, TLS setup and all.
+  #
+  # It is the expensive job in this file (a from-source wasm-bindgen-cli
+  # and a headless browser), so it is deliberately the last line of
+  # defence rather than the first.
+  browser:
+    name: Browser main-thread (Chrome)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+            --component rust-src --target wasm32-unknown-unknown
+          rustup default "$RUST_TOOLCHAIN"
+
+      # The CLI and the crate must be the same version — wasm-bindgen's
+      # schema is checked exactly — so take the version from the lockfile
+      # rather than pinning one here that drifts.
+      - name: Install wasm-bindgen-cli matching the lockfile
+        run: |
+          version=$(cargo metadata --format-version 1 --filter-platform wasm32-unknown-unknown \
+            | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version' | head -1)
+          echo "wasm-bindgen $version"
+          cargo install wasm-bindgen-cli --version "$version"
+
+      - name: Run the main-agent tests in Chrome
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+          RUSTFLAGS: -Ctarget-feature=+atomics,+bulk-memory,+mutable-globals
+        run: |
+          # The runner image ships Chrome and a matching ChromeDriver.
+          export CHROMEDRIVER="$(command -v chromedriver)"
+          cargo test -p krio-wasm --target wasm32-unknown-unknown \
+            -Zbuild-std=std,panic_abort --test browser

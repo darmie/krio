@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 
 use krio_core::{Clock, Suspension, Task, TaskId};
-use krio_parallel::{Cluster, SpinPark, TaskObserver};
+use krio_parallel::{Cluster, Park, SpinPark, TaskObserver};
 use krio_runtime::{AgentId, AgentRole, Drive, ParallelScheduler};
 
 // ── Clocks ────────────────────────────────────────────────────────
@@ -327,6 +327,77 @@ fn a_task_spawned_after_agents_park_still_gets_picked_up() {
 
     cluster.shutdown();
     worker.join().unwrap();
+}
+
+// ── The main agent must never block ───────────────────────────────
+
+/// A [`Park`] that refuses to be used.
+///
+/// `memory.atomic.wait32` throws on a browser's main thread, and nothing
+/// in the type system prevents an agent from reaching it — the same
+/// `WasmPark` is legitimately shared by every agent in the cluster. The
+/// rule is structural: `run()` parks and is worker-only, `drive_once()`
+/// never parks.
+///
+/// A browser is one place to check that, and a poor one to rely on: it
+/// needs a driver, a headless engine and cross-origin isolation, and it
+/// only fails once someone has already shipped the regression. Handing
+/// the cluster a parker that panics tests the same claim on every
+/// target, in microseconds, right next to the code.
+struct PoisonPark;
+
+impl Park for PoisonPark {
+    fn park(&self, _slot: &std::sync::atomic::AtomicU32, _expected: u32) {
+        panic!("drive_once() parked — this throws on a browser main thread");
+    }
+    fn unpark(&self, _slot: &std::sync::atomic::AtomicU32) {
+        // Notifying is fine anywhere; only waiting is forbidden.
+    }
+}
+
+#[test]
+fn drive_once_never_parks_however_it_is_called() {
+    let done = Arc::new(AtomicUsize::new(0));
+    let cluster = Cluster::new(3, PoisonPark, StdClock::new());
+
+    // Idle: the tempting place to "just wait for work".
+    assert_eq!(cluster.drive_once(AgentId(0), AgentRole::Main), Drive::Idle);
+    assert_eq!(
+        cluster.drive_once(AgentId(0), AgentRole::Worker),
+        Drive::Idle
+    );
+
+    // Busy, and over budget, so the pass ends early with work left.
+    for _ in 0..64 {
+        cluster.spawn(countdown(2, &done));
+    }
+    while done.load(Ordering::Relaxed) < 64 {
+        assert_ne!(
+            cluster.drive_once(AgentId(0), AgentRole::Main),
+            Drive::ShuttingDown
+        );
+    }
+
+    // Holding nothing but a waiting task — the other place an agent
+    // might decide there is nothing better to do than sleep.
+    struct Waiter;
+    impl Task for Waiter {
+        fn step(&mut self) -> Suspension {
+            Suspension::Pending
+        }
+    }
+    cluster.spawn_on(AgentId(0), Box::new(Waiter));
+    cluster.drive_once(AgentId(0), AgentRole::Main);
+    assert_eq!(cluster.parked_count(), 1);
+    assert_eq!(cluster.drive_once(AgentId(0), AgentRole::Main), Drive::Idle);
+
+    // Shutdown notifies every agent; unparking is allowed, waiting is
+    // not, so this must not trip the poison either.
+    cluster.shutdown();
+    assert_eq!(
+        cluster.drive_once(AgentId(0), AgentRole::Main),
+        Drive::ShuttingDown
+    );
 }
 
 // ── Waiting tasks ─────────────────────────────────────────────────
