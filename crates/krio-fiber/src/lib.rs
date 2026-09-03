@@ -79,6 +79,6 @@ mod stack;
 
 pub use fiber::{
     DEFAULT_STACK_SIZE, Fiber, FiberState, FiberStep, current_fiber_id, is_cancelled,
-    is_deadline_passed, should_yield_early, take_input, take_input_u64, yield_now, yield_u64,
-    yield_value,
+    is_deadline_passed, now_ms, set_clock, should_yield_early, take_input, take_input_u64,
+    yield_now, yield_u64, yield_value,
 };

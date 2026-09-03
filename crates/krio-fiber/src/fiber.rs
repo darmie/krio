@@ -3,7 +3,7 @@
 
 use std::any::Any;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use krio_core::{Suspension, Task};
 
@@ -699,13 +699,79 @@ pub fn should_yield_early() -> bool {
     is_cancelled() || is_deadline_passed()
 }
 
-/// Current Unix time in milliseconds. Used for deadline checks.
-fn current_time_ms() -> f64 {
+/// Host-installed time source, as a raw `fn() -> f64`. Zero means
+/// "not installed"; see [`set_clock`].
+static CLOCK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the time source deadline checks read.
+///
+/// Deadline polling is a hot path — a cooperative fiber calls
+/// [`should_yield_early`] at every checkpoint — so this is a bare
+/// `fn` pointer rather than a `&dyn Clock`: no vtable, no allocation,
+/// and a non-capturing closure over a static coerces straight into it.
+///
+/// The intended shape on a target with shared memory is a counter one
+/// agent bumps and everyone else reads:
+///
+/// ```
+/// # use core::sync::atomic::{AtomicU64, Ordering};
+/// static EPOCH_MS: AtomicU64 = AtomicU64::new(0);
+/// krio_fiber::set_clock(|| EPOCH_MS.load(Ordering::Relaxed) as f64);
+/// ```
+///
+/// Whatever is installed here is also what [`crate::now_ms`] returns,
+/// which is how a scheduler layered on top of fibers — `krio-preempt`,
+/// say — is guaranteed to measure slices against the same origin the
+/// fiber measures its deadline against. Two clocks with two origins
+/// would make a deadline set by one meaningless to the other.
+///
+/// Installing twice is allowed; the last one wins. There is no way to
+/// read the current value back, deliberately — a host that needs to
+/// know owns the function it installed.
+pub fn set_clock(clock: fn() -> f64) {
+    CLOCK.store(clock as usize, Ordering::Release);
+}
+
+/// Milliseconds from the installed clock's origin.
+///
+/// Falls back to wall-clock time where the target has one. On
+/// `wasm32-unknown-unknown` there is no time source at all —
+/// `SystemTime::now()` traps with *time not implemented on this
+/// platform* — so the fallback there is a constant, which makes
+/// deadlines simply never fire. That is the safe failure: a fiber that
+/// never yields early is worse scheduling, whereas a trap is a dead
+/// program. Install a real clock with [`set_clock`] to get deadlines
+/// back.
+pub fn now_ms() -> f64 {
+    let installed = CLOCK.load(Ordering::Acquire);
+    if installed != 0 {
+        // SAFETY: only ever written by `set_clock` from a `fn() -> f64`,
+        // and a fn pointer stays valid for the life of the program.
+        let clock: fn() -> f64 = unsafe { core::mem::transmute(installed) };
+        return clock();
+    }
+    default_now_ms()
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn default_now_ms() -> f64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64() * 1000.0)
         .unwrap_or(0.0)
+}
+
+/// No time source exists on this target and `SystemTime::now()` traps,
+/// so report a frozen clock rather than taking the program down.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn default_now_ms() -> f64 {
+    0.0
+}
+
+/// Current time in milliseconds. Used for deadline checks.
+fn current_time_ms() -> f64 {
+    now_ms()
 }
 
 /// Lay out a fresh fiber stack so a `krio_fiber_switch` *into* it

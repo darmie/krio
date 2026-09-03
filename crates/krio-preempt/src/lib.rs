@@ -29,7 +29,7 @@
 //! caps each resume at a wall-clock slice, so multiple fibers
 //! progress fairly even when individual yields are far apart.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use krio_core::{Suspension, Task};
 use krio_fiber::Fiber;
@@ -116,9 +116,17 @@ impl TimeSliceScheduler {
     }
 }
 
+/// Deliberately `krio-fiber`'s clock rather than one of our own.
+///
+/// A slice deadline computed here is handed straight to
+/// [`krio_fiber::Fiber::set_deadline_ms`] and then compared, inside the
+/// fiber, against whatever `krio-fiber` thinks the time is. Two clocks
+/// with two origins would make that comparison meaningless — the fiber
+/// would yield instantly or never. Reading through
+/// [`krio_fiber::now_ms`] makes them the same clock by construction,
+/// and lets a host retarget both at once with
+/// [`krio_fiber::set_clock`] — which is what a wasm host must do, since
+/// `SystemTime::now()` traps on `wasm32-unknown-unknown`.
 fn current_time_ms() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64() * 1000.0)
-        .unwrap_or(0.0)
+    krio_fiber::now_ms()
 }
