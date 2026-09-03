@@ -59,6 +59,7 @@ mod deque;
 mod injector;
 mod observer;
 mod park;
+mod parked;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -70,6 +71,7 @@ use krio_runtime::{AgentId, AgentRole, Budget, Drive, ParallelScheduler};
 
 use deque::Deque;
 use injector::Injector;
+use parked::Parked;
 
 pub use observer::TaskObserver;
 pub use park::{NOTIFIED, PARKED, Park, RUNNING, SpinPark};
@@ -106,6 +108,10 @@ struct Agent {
 pub struct Cluster<P: Park, C: Clock + Sync> {
     agents: Box<[Agent]>,
     injector: Injector<Job>,
+    /// Tasks that returned `Pending` and are waiting on something. Held
+    /// out of the run queues so an agent can genuinely sleep instead of
+    /// polling a channel that cannot have changed.
+    parked: Parked<Job>,
     parker: P,
     clock: C,
     stopping: AtomicBool,
@@ -142,6 +148,7 @@ impl<P: Park, C: Clock + Sync> Cluster<P, C> {
         Self {
             agents: agents.into_boxed_slice(),
             injector: Injector::new(),
+            parked: Parked::new(),
             parker,
             clock,
             stopping: AtomicBool::new(false),
@@ -250,6 +257,51 @@ impl<P: Park, C: Clock + Sync> Cluster<P, C> {
         None
     }
 
+    /// Return a task that returned [`Suspension::Pending`] to the run
+    /// queues.
+    ///
+    /// Call this when whatever the task was waiting on has happened —
+    /// a channel received, a timer fired, a response arrived. krio does
+    /// not own channels, so it cannot know when that is; the host that
+    /// does own them calls this. The [`TaskId`] comes from
+    /// [`TaskObserver::on_step_begin`], which already carries it.
+    ///
+    /// Safe to call from any agent, and safe to call *early* — a wake
+    /// that arrives before the task has finished parking is remembered
+    /// and applied when it does, so a wake is never lost to that race.
+    ///
+    /// Returns `true` if a parked task was actually resumed. `false`
+    /// means either the task was not parked (it may be running, or
+    /// already finished) or the wake arrived early and has been
+    /// recorded — the two are indistinguishable from outside, and both
+    /// are harmless.
+    ///
+    /// One wart worth knowing: waking a task that has already completed
+    /// records a wake nothing will ever claim, leaving a `u64` behind. A
+    /// host that only wakes live tasks leaks nothing.
+    pub fn wake(&self, task: TaskId) -> bool {
+        match self.parked.wake(task) {
+            Some(job) => {
+                // Via the injector rather than a specific agent's deque:
+                // the waker is usually not the agent that parked it, and
+                // deques are single-owner.
+                self.injector.push(job);
+                self.notify_one();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// How many tasks are waiting on a [`Cluster::wake`].
+    ///
+    /// Parked tasks are deliberately not counted by
+    /// [`Cluster::has_work`] — they are not runnable, and treating them
+    /// as work is exactly what would stop an agent from ever sleeping.
+    pub fn parked_count(&self) -> usize {
+        self.parked.len()
+    }
+
     /// Move one agent out of `PARKED` and wake it. Does not disturb
     /// agents that are already running.
     fn notify_one(&self) {
@@ -309,13 +361,25 @@ impl<P: Park, C: Clock + Sync> ParallelScheduler for Cluster<P, C> {
 
             match suspension {
                 Suspension::Completed => drop(job),
-                // Still alive: back onto this agent's deque. Note a
-                // `Pending` task is re-queued rather than parked — the
-                // cluster has no waker registry yet, so a task waiting
-                // on an event spins its agent. Matches `RoundRobin`'s
-                // existing semantics; a registry is the fix, not a
-                // different re-queue.
-                _ => {
+
+                // Waiting on something. Hold it out of the run queues
+                // entirely, or an agent with one blocked task spins a
+                // core polling a channel that cannot have changed.
+                //
+                // `park` hands the job straight back when a wake beat it
+                // here, which is the lost-wakeup race: the event fired
+                // on another agent between `step` returning and this
+                // line. Re-queue in that case rather than sleeping.
+                Suspension::Pending => {
+                    let id = job.id;
+                    if let Some(job) = self.parked.park(id, job) {
+                        self.deposit(agent, job);
+                    }
+                }
+
+                // Yielded: wants to run again, so back onto this agent's
+                // deque, newest-first.
+                Suspension::Yielded => {
                     self.deposit(agent, job);
                     // Only worth waking a thief if we left surplus.
                     if self.agents[agent.0 as usize].deque.len() > 1 {

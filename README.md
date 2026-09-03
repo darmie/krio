@@ -55,7 +55,7 @@ tasks (per-fiber stack, but suspension Just Works).
 | `krio-fiber`     | ✅ shipped — Fiber on x86_64 (SysV + MS x64) + aarch64 (non-Windows) |
 | `krio-async`     | ✅ Phase 3 v2 — direct-yield + captures lift + cross-fn dispatch + multi-suspension blocks |
 | `krio-preempt`   | 🟨 v1 — TimeSliceScheduler (cooperative slicing); real signal preempt deferred |
-| `krio-parallel`  | 🟨 v1 — Cluster: bounded Chase–Lev deques, injector overflow, role-derived budgets. Needs a `Park` backend per target |
+| `krio-parallel`  | 🟨 v1 — Cluster: bounded Chase–Lev deques, injector overflow, role-derived budgets, waker registry. Needs a `Park` backend per target |
 | `krio-wasm`      | 🟨 v1 — shared-memory parking, epoch clock, agent-spawn hook. Verified on wasm under wasmtime; browser harness not yet written |
 
 ## Tradeoffs at a glance
@@ -112,6 +112,31 @@ entry point a browser's main thread may use, because
 `AgentRole` rather than a setting — the value that decides how an agent
 waits also decides how long it runs, so a host cannot starve a UI thread
 by forgetting to configure something.
+
+### Waiting tasks
+
+`Suspension` draws a distinction worth honouring: `Yielded` means *give
+someone else a turn*, `Pending` means *I am waiting on something*.
+Re-queueing both loses nothing, but an agent holding one `Pending` task
+spins a core polling a channel that cannot have changed. So a `Pending`
+task is moved out of the run queues until it is woken:
+
+```rust
+// The host owns the channel, so the host says when it is ready.
+// The TaskId comes from TaskObserver::on_step_begin.
+cluster.wake(task_id);
+```
+
+krio does not own channels — the stackless transform emits the peek and
+leaves the recv to the host — so it cannot know when a wait is over, and
+does not guess. Threading a waker through `Task::step` would be the
+other design, and would mean adding a parameter to a trait that
+`RoundRobin` and `Fiber` also implement and neither could use.
+
+Waking early is safe. A wake that arrives before the task has finished
+parking is recorded and applied when it does, so the race between "step
+returned Pending" and "the event fired on another agent" cannot lose a
+wakeup.
 
 ### Clocks on targets that don't have one
 

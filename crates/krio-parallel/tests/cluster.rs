@@ -328,3 +328,179 @@ fn a_task_spawned_after_agents_park_still_gets_picked_up() {
     cluster.shutdown();
     worker.join().unwrap();
 }
+
+// ── Waiting tasks ─────────────────────────────────────────────────
+
+/// Returns `Pending` until `ready` is set, counting every poll so a
+/// test can prove the scheduler is not spinning on it.
+struct Waiter {
+    ready: Arc<std::sync::atomic::AtomicBool>,
+    polls: Arc<AtomicUsize>,
+    done: Arc<AtomicUsize>,
+}
+
+impl Task for Waiter {
+    fn step(&mut self) -> Suspension {
+        self.polls.fetch_add(1, Ordering::Relaxed);
+        if self.ready.load(Ordering::Acquire) {
+            self.done.fetch_add(1, Ordering::Relaxed);
+            Suspension::Completed
+        } else {
+            Suspension::Pending
+        }
+    }
+}
+
+#[test]
+fn a_pending_task_is_parked_rather_than_polled_in_a_loop() {
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicUsize::new(0));
+
+    let cluster = Cluster::new(1, SpinPark::default(), StdClock::new());
+    cluster.spawn_on(
+        AgentId(0),
+        Box::new(Waiter {
+            ready: Arc::clone(&ready),
+            polls: Arc::clone(&polls),
+            done: Arc::clone(&done),
+        }),
+    );
+
+    // First pass polls it once, learns it is waiting, and sets it aside.
+    assert_eq!(
+        cluster.drive_once(AgentId(0), AgentRole::Worker),
+        Drive::Ran(1)
+    );
+    assert_eq!(polls.load(Ordering::Relaxed), 1);
+    assert_eq!(cluster.parked_count(), 1);
+
+    // This is the whole point: further passes find nothing to do. A
+    // waiting task must not be work, or an agent can never sleep.
+    for _ in 0..50 {
+        assert_eq!(
+            cluster.drive_once(AgentId(0), AgentRole::Worker),
+            Drive::Idle
+        );
+    }
+    assert_eq!(
+        polls.load(Ordering::Relaxed),
+        1,
+        "a parked task was polled again — the agent is spinning on it"
+    );
+    assert!(!cluster.has_work(), "a waiting task must not count as work");
+}
+
+#[test]
+fn waking_a_pending_task_puts_it_back_to_work() {
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicUsize::new(0));
+
+    let cluster = Cluster::new(1, SpinPark::default(), StdClock::new());
+    let id = cluster.spawn_on(
+        AgentId(0),
+        Box::new(Waiter {
+            ready: Arc::clone(&ready),
+            polls: Arc::clone(&polls),
+            done: Arc::clone(&done),
+        }),
+    );
+
+    cluster.drive_once(AgentId(0), AgentRole::Worker);
+    assert_eq!(cluster.parked_count(), 1);
+
+    // The host's channel received something.
+    ready.store(true, Ordering::Release);
+    assert!(cluster.wake(id), "waking a parked task must resume it");
+    assert_eq!(cluster.parked_count(), 0);
+    assert!(cluster.has_work());
+
+    assert_eq!(
+        cluster.drive_once(AgentId(0), AgentRole::Worker),
+        Drive::Ran(1)
+    );
+    assert_eq!(done.load(Ordering::Relaxed), 1);
+    assert_eq!(polls.load(Ordering::Relaxed), 2);
+
+    // Waking something that is gone is a no-op, not a panic.
+    assert!(!cluster.wake(id));
+}
+
+#[test]
+fn a_wake_that_arrives_before_the_task_parks_is_not_lost() {
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicUsize::new(0));
+
+    let cluster = Cluster::new(1, SpinPark::default(), StdClock::new());
+    let id = cluster.spawn_on(
+        AgentId(0),
+        Box::new(Waiter {
+            ready: Arc::clone(&ready),
+            polls: Arc::clone(&polls),
+            done: Arc::clone(&done),
+        }),
+    );
+
+    // The event fires before the task has ever run, let alone parked.
+    // Recording it is what stops the task sleeping through its wake.
+    assert!(!cluster.wake(id), "nothing is parked yet");
+
+    // The pass polls it, sees Pending, and finds the recorded wake — so
+    // it re-queues and polls again instead of going to sleep.
+    let drive = cluster.drive_once(AgentId(0), AgentRole::Worker);
+    assert_eq!(drive, Drive::Ran(2), "the recorded wake must be consumed");
+    assert_eq!(polls.load(Ordering::Relaxed), 2);
+    assert_eq!(cluster.parked_count(), 1, "and then it parks for real");
+
+    // Still reachable afterwards.
+    ready.store(true, Ordering::Release);
+    assert!(cluster.wake(id));
+    cluster.drive_once(AgentId(0), AgentRole::Worker);
+    assert_eq!(done.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_wake_reaches_an_agent_that_has_gone_to_sleep() {
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicUsize::new(0));
+
+    let cluster = Arc::new(Cluster::new(2, SpinPark::default(), StdClock::new()));
+    let id = cluster.spawn_on(
+        AgentId(1),
+        Box::new(Waiter {
+            ready: Arc::clone(&ready),
+            polls: Arc::clone(&polls),
+            done: Arc::clone(&done),
+        }),
+    );
+
+    let worker = {
+        let cluster = Arc::clone(&cluster);
+        thread::spawn(move || cluster.run(AgentId(1)))
+    };
+
+    // It runs the task once, parks the task, then parks itself — there
+    // is genuinely nothing left to do.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while cluster.parked_count() == 0 {
+        assert!(std::time::Instant::now() < deadline, "task never parked");
+        thread::yield_now();
+    }
+
+    ready.store(true, Ordering::Release);
+    cluster.wake(id);
+
+    while done.load(Ordering::Relaxed) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a sleeping agent missed a task wake"
+        );
+        thread::yield_now();
+    }
+
+    cluster.shutdown();
+    worker.join().unwrap();
+}
