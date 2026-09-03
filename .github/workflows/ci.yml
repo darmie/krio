@@ -113,6 +113,12 @@ jobs:
         target:
           - aarch64-pc-windows-msvc
           - wasm32-unknown-unknown
+          # atomics/bulk-memory on by default, so this is the row that
+          # type-checks krio-wasm's shared-memory parking path. The
+          # bare wasm32-unknown-unknown row above deliberately does not
+          # have atomics, and covers the other half: that the crate
+          # still builds when the instructions are unavailable.
+          - wasm32-wasip1-threads
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -122,20 +128,64 @@ jobs:
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "${{ matrix.target }}"
           rustup default "$RUST_TOOLCHAIN"
 
+      # `check --all-targets`, deliberately, on both counts.
+      #
       # --all-targets, not just the lib: the panic-stub path is easy to
       # keep compiling while a test or bench that assumes a real context
       # switch quietly breaks. `tests/abi.rs` did exactly that — an
       # ungated `sp_now()` that only assigns its output under x86_64 or
       # aarch64, so every other target failed to build the test binary
       # while `cargo build` stayed green.
-      - name: Build krio-fiber
-        run: cargo build -p krio-fiber --all-targets --target "${{ matrix.target }}"
+      #
+      # `check` rather than `build`, because --all-targets adds test
+      # *binaries*, and linking one for aarch64-pc-windows-msvc needs
+      # link.exe, which an ubuntu runner does not have. The lib-only
+      # build got away with it by never linking. Checking still catches
+      # the whole class of error this job exists for — the sp_now break
+      # was E0381, found long before the linker — and the shared-memory
+      # job below does link and run for real.
+      - name: Check krio-fiber
+        run: cargo check -p krio-fiber --all-targets --target "${{ matrix.target }}"
 
       # The portable half of the family has to keep working on wasm, and
       # krio-parallel is the crate that will grow a shared-memory
       # backend, so it is worth gating now rather than after it drifts.
-      - name: Build portable crates
+      - name: Check portable crates
         run: |
-          cargo build --all-targets --target "${{ matrix.target }}" \
+          cargo check --all-targets --target "${{ matrix.target }}" \
             -p krio-core -p krio-runtime -p krio-stackless \
-            -p krio-async -p krio-parallel
+            -p krio-async -p krio-parallel -p krio-wasm
+
+  # Compiling the atomics path is not the same as it working. This job
+  # executes the cluster on a real engine with a real shared memory:
+  # several agents over one linear memory, parking on
+  # `memory.atomic.wait32` and woken by `memory.atomic.notify`.
+  #
+  # wasm32-wasip1-threads stands in for a browser because it has the
+  # same shape — one instance per agent over one shared memory — and
+  # needs no headless browser to drive. It is a probe, not a production
+  # target: threads were removed from WASI Preview 2, which is exactly
+  # why krio-wasm makes agent creation a host hook instead of a WASI
+  # import. When this engine goes away the harness is what changes.
+  shared-memory:
+    name: Shared-memory wasm (wasmtime)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target wasm32-wasip1-threads
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Install wasmtime
+        run: |
+          curl -sSf https://wasmtime.dev/install.sh | bash
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+
+      - name: Run the cluster on shared memory
+        env:
+          CARGO_TARGET_WASM32_WASIP1_THREADS_RUNNER: wasmtime -W threads=y -W shared-memory=y -S threads=y
+        run: |
+          cargo test -p krio-parallel -p krio-wasm --target wasm32-wasip1-threads

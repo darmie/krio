@@ -23,8 +23,10 @@ krio
 ├── krio-fiber        — Wren/Lua-style stackful runtime
 │                       (Fiber implements krio-core::Task)
 ├── krio-preempt      — preemptive scheduler (planned)
-└── krio-parallel     — work stealing across agents sharing one
-                        address space (threads / Web Workers)
+├── krio-parallel     — work stealing across agents sharing one
+│                       address space (threads / Web Workers)
+└── krio-wasm         — the WebAssembly backend for krio-parallel;
+                        the only crate that knows about browsers
 ```
 
 ## Picking a variant
@@ -36,6 +38,7 @@ krio
 | First-class fibers, yield from any depth, simple programmer model | `krio-fiber`       |
 | Forced timeslicing — fibers can't starve each other          | `krio-preempt`     |
 | Tasks spread over OS threads or Web Workers                  | `krio-parallel`    |
+| …and the target is wasm                                      | `+ krio-wasm`      |
 
 The variants are not mutually exclusive — most languages ship two or
 three. A microkernel might use `krio-stackless` for the hot path
@@ -53,6 +56,7 @@ tasks (per-fiber stack, but suspension Just Works).
 | `krio-async`     | ✅ Phase 3 v2 — direct-yield + captures lift + cross-fn dispatch + multi-suspension blocks |
 | `krio-preempt`   | 🟨 v1 — TimeSliceScheduler (cooperative slicing); real signal preempt deferred |
 | `krio-parallel`  | 🟨 v1 — Cluster: bounded Chase–Lev deques, injector overflow, role-derived budgets. Needs a `Park` backend per target |
+| `krio-wasm`      | 🟨 v1 — shared-memory parking, epoch clock, agent-spawn hook. Verified on wasm under wasmtime; browser harness not yet written |
 
 ## Tradeoffs at a glance
 
@@ -125,3 +129,35 @@ krio_fiber::set_clock(|| EPOCH_MS.load(Ordering::Relaxed) as f64);
 A deadline check is then one relaxed load from shared memory — no
 syscall, and no crossing into JS on a path a coroutine polls in its hot
 loop.
+
+### On WebAssembly
+
+`krio-wasm` is the backend, and the only crate in the family that knows
+browsers exist. What a host has to supply turned out to be smaller than
+expected:
+
+- **Parking needs nothing.** `memory.atomic.wait32` and
+  `memory.atomic.notify` are core wasm instructions, so an agent sleeps
+  and is woken without the host in the loop.
+- **Agent creation needs a hook** — `krio_wasm::set_spawn`. A wasm
+  module cannot start a Worker, and it should not hard-code an import
+  for it either: a declared import must be supplied at instantiation
+  even by a host that never spawns anything.
+- **The clock needs a ticker** — call `publish_epoch_ms` on an interval.
+
+Requires `-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals` with
+`-Zbuild-std`, and cross-origin isolation (`COOP: same-origin` +
+`COEP: require-corp`) for `SharedArrayBuffer`. `cluster_support()`
+returns `None` when the build cannot host a cluster, so the natural
+spelling refuses to start rather than silently running one agent.
+
+The browser main thread never parks: `memory.atomic.wait32` throws
+there. It drives the cluster with `drive_once()` and is woken by the
+same `notify` via `Atomics.waitAsync` on the JS side — so a waker never
+has to know which kind of agent it is waking.
+
+The whole path is exercised on a real engine, not just compiled:
+`cargo test -p krio-wasm --target wasm32-wasip1-threads` under wasmtime
+runs four agents over one shared linear memory, including an agent
+parked indefinitely on `atomic.wait32` and woken by another agent's
+`notify`.

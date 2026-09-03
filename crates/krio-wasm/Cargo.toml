@@ -1,0 +1,23 @@
+[package]
+name = "krio-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WebAssembly backend for krio-parallel: shared-memory parking, an epoch clock, and the agent-spawn contract. The only krio crate that knows about browsers."
+
+[dependencies]
+krio-core = { workspace = true }
+krio-runtime = { workspace = true }
+krio-parallel = { workspace = true }
+krio-fiber = { workspace = true, optional = true }
+
+[features]
+default = []
+# Wire the epoch clock into krio-fiber's global deadline clock. Off by
+# default so a host driving only stackless tasks does not pull in the
+# fiber crate at all.
+fiber-clock = ["dep:krio-fiber"]
+
+[lints]
+workspace = true

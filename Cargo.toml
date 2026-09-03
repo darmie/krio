@@ -8,6 +8,7 @@ members = [
     "crates/krio-fiber",
     "crates/krio-preempt",
     "crates/krio-parallel",
+    "crates/krio-wasm",
 ]
 
 [workspace.package]
@@ -25,6 +26,7 @@ krio-async     = { path = "crates/krio-async",     version = "0.1.0" }
 krio-fiber     = { path = "crates/krio-fiber",     version = "0.1.0" }
 krio-preempt   = { path = "crates/krio-preempt",   version = "0.1.0" }
 krio-parallel  = { path = "crates/krio-parallel",  version = "0.1.0" }
+krio-wasm      = { path = "crates/krio-wasm",      version = "0.1.0" }
 
 [workspace.lints.clippy]
 collapsible_if = "allow"
