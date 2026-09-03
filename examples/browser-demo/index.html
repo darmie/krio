@@ -1,0 +1,116 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>krio-parallel in the browser</title>
+<style>
+  body { font: 14px/1.5 ui-monospace, Menlo, monospace; margin: 2rem; max-width: 60rem; }
+  h1 { font-size: 1.1rem; }
+  table { border-collapse: collapse; margin: 1rem 0; }
+  th, td { text-align: right; padding: 4px 12px; border-bottom: 1px solid #ccc; }
+  th:last-child, td:last-child { text-align: left; }
+  caption { text-align: left; font-weight: 600; padding: 8px 0; }
+  #status { color: #555; }
+  .bad { color: #b00; font-weight: 600; }
+</style>
+<h1>krio-parallel across Web Workers on shared memory</h1>
+<p id="status">starting…</p>
+<div id="out"></div>
+<pre id="env"></pre>
+
+<script type="module">
+import init, * as demo from './pkg/krio_browser_demo.js';
+
+const params = new URLSearchParams(location.search);
+const AGENTS    = +(params.get('agents')    ?? 4);
+const TASKS     = +(params.get('tasks')     ?? 48);
+const ROUNDS    = +(params.get('rounds')    ?? 12);
+const PER_ROUND = +(params.get('per_round') ?? 20000);
+
+const status = document.getElementById('status');
+const out = document.getElementById('out');
+const say = (m) => { status.textContent = m; };
+
+function table(caption, rows) {
+  const t = document.createElement('table');
+  t.innerHTML = `<caption>${caption}</caption>
+    <tr><th>agents</th><th>wall (ms)</th><th>max concurrent</th>
+        <th>steals</th><th>steps per agent</th></tr>` +
+    rows.map(r => `<tr><td>${r.agents}</td><td>${r.ms.toFixed(0)}</td>
+        <td>${r.maxConcurrent}</td><td>${r.steals}</td><td>${r.share}</td></tr>`).join('');
+  out.appendChild(t);
+}
+
+async function main() {
+  if (!self.crossOriginIsolated) {
+    say('NOT cross-origin isolated — no SharedArrayBuffer. Serve with COOP/COEP.');
+    status.className = 'bad';
+    return;
+  }
+
+  // Compile once; every agent instantiates this same module.
+  const module = await WebAssembly.compileStreaming(fetch('./pkg/krio_browser_demo_bg.wasm'));
+  const outp = await init({ module_or_path: module });
+  const memory = outp.memory;
+
+  document.getElementById('env').textContent =
+    `crossOriginIsolated: ${self.crossOriginIsolated}\n` +
+    `memory is SharedArrayBuffer: ${memory.buffer instanceof SharedArrayBuffer}\n` +
+    `hardwareConcurrency: ${navigator.hardwareConcurrency}\n` +
+    `agents: ${AGENTS} (1 main + ${AGENTS - 1} workers), ` +
+    `${TASKS} tasks x ${ROUNDS} rounds`;
+
+  demo.init_cluster(AGENTS);
+
+  // A ticker for the epoch clock: the main agent's frame budget is
+  // measured against it, so without this the budget never expires.
+  setInterval(() => demo.publish_epoch_ms(performance.now()), 4);
+
+  // Agents 1..N-1 are Workers. Agent 0 is this thread, which must never
+  // block, so it drives with `drive_main()` instead of `run()`.
+  const ready = [];
+  for (let a = 1; a < AGENTS; a++) {
+    const w = new Worker('./worker.js', { type: 'module' });
+    ready.push(new Promise(res => w.onmessage = () => res()));
+    w.postMessage({ module, memory, agent: a });
+  }
+  await Promise.all(ready);
+  say(`${AGENTS - 1} workers up; running…`);
+
+  const rows = { injector: [], stolen: [] };
+
+  for (const mode of ['injector', 'stolen']) {
+    demo.reset_stats();
+    demo.submit(TASKS, ROUNDS, PER_ROUND, mode === 'stolen');
+
+    const t0 = performance.now();
+    // The main-agent pump: one bounded pass, then back to the event
+    // loop so the page stays alive, exactly as a real host would.
+    await new Promise(resolve => {
+      (function pump() {
+        demo.drive_main();
+        if (demo.completed() >= TASKS) return resolve();
+        setTimeout(pump, 0);
+      })();
+    });
+    const ms = performance.now() - t0;
+
+    const [maxConcurrent, steals, ...share] = demo.stats_csv().split(',').map(Number);
+    rows[mode].push({ agents: AGENTS, ms, maxConcurrent, steals, share: share.join(' ') });
+  }
+
+  table('spawn() — shared injector, every agent pulls its own', rows.injector);
+  table('spawn_on(agent 0) — one agent owns it all; the rest must steal', rows.stolen);
+
+  demo.shutdown();
+  say('done');
+  document.title = 'krio done';
+
+  // Report back so a headless run can read real timings: no WebDriver,
+  // and no --virtual-time-budget distorting performance.now().
+  const payload = { env: document.getElementById('env').textContent, rows };
+  try {
+    await fetch('/__result?data=' + encodeURIComponent(JSON.stringify(payload)));
+  } catch (_) { /* opened by hand, no collector listening */ }
+}
+
+main().catch(e => { say('ERROR: ' + e); status.className = 'bad'; console.error(e); });
+</script>

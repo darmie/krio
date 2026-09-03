@@ -15,7 +15,7 @@
 //! would still pass. Here, the same mistake is an uncaught
 //! `RuntimeError` and the test fails.
 //!
-//! Run with:
+//! Run with a matching ChromeDriver:
 //!
 //! ```text
 //! CHROMEDRIVER=$(which chromedriver) \
@@ -24,8 +24,36 @@
 //!   -Zbuild-std=std,panic_abort --test browser
 //! ```
 //!
-//! Requires cross-origin isolation for `SharedArrayBuffer`;
-//! `wasm-bindgen-test-runner` serves the COOP/COEP headers itself.
+//! ## Without a driver
+//!
+//! ChromeDriver has to match Chrome's major version exactly, which is a
+//! reliable way to be blocked on a developer machine — Homebrew disabled
+//! its matching build over a Gatekeeper failure while this was written.
+//! No driver is needed. `NO_HEADLESS=1` makes the runner serve the tests
+//! and wait instead of driving a browser, and any browser can then load
+//! them:
+//!
+//! ```text
+//! NO_HEADLESS=1 RUSTFLAGS='-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals' \
+//!   cargo test -p krio-wasm --target wasm32-unknown-unknown \
+//!   -Zbuild-std=std,panic_abort --test browser
+//! # → Interactive browsers tests are now available at http://127.0.0.1:8000
+//!
+//! # open that URL, or scrape it without touching a driver:
+//! "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+//!   --headless=new --virtual-time-budget=20000 --dump-dom \
+//!   http://127.0.0.1:8000/
+//! ```
+//!
+//! The one thing that would otherwise bite is cross-origin isolation:
+//! without it there is no `SharedArrayBuffer` and an atomics module will
+//! not instantiate at all. The runner's own server already sends
+//! `Cross-Origin-Opener-Policy: same-origin` and
+//! `Cross-Origin-Embedder-Policy: require-corp`, so this works as-is.
+//!
+//! The trade for skipping the driver is that a failure shows up in the
+//! page rather than in an exit code, which is why CI still uses the
+//! driver — its runner image ships a matched pair.
 
 // `target_feature = "atomics"` as well as the target itself: a plain
 // wasm32-unknown-unknown build has no atomics, so `WasmPark` implements

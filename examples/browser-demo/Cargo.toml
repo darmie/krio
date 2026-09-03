@@ -1,0 +1,22 @@
+[package]
+name = "krio-browser-demo"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+krio-core = { path = "../../crates/krio-core" }
+krio-runtime = { path = "../../crates/krio-runtime" }
+krio-parallel = { path = "../../crates/krio-parallel" }
+krio-wasm = { path = "../../crates/krio-wasm" }
+wasm-bindgen = "0.2.127"
+
+# Standalone: this needs -Ctarget-feature=+atomics and -Zbuild-std, which
+# the workspace deliberately does not impose on everything else.
+[workspace]
+
+[profile.release]
+opt-level = 3
