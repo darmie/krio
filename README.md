@@ -265,12 +265,6 @@ diagnosable, a torn heap is not.
 The browser main thread cannot block, so it uses `request_safepoint()`,
 polls `world_is_stopped()`, and calls `resume_world()` when finished.
 
-
-
-
-## License
-
-MIT OR Apache-2.0 (see [LICENSE](LICENSE)).
 ## Architecture support
 
 `krio-fiber` needs a context switch per (architecture, ABI). Everything
@@ -295,3 +289,9 @@ routes `yield_now` to a host suspender there, and the rest of the family
 — including `krio-parallel`, which is `no_std` and never spawns a thread
 of its own — works regardless. A single-agent cluster driven by
 `drive_once` needs no threading support at all.
+
+
+## License
+
+MIT OR Apache-2.0 (see [LICENSE](LICENSE)).
+
