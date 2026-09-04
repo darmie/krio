@@ -179,10 +179,23 @@ jobs:
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target wasm32-wasip1-threads
           rustup default "$RUST_TOOLCHAIN"
 
+      # Pinned, and the pin has an expiry date on it. wasmtime 47 removed
+      # `-S threads`, its wasi-threads support, so the latest release
+      # cannot run this job at all: without that flag there is no
+      # wasi-threads host and the module fails on `unknown import:
+      # env::memory`. v46.0.0 is the last one that has it.
+      #
+      # This is the withdrawal the design anticipated — threads were
+      # removed from WASI Preview 2 and the engines are following — and
+      # it is why agent creation is a host hook rather than a WASI
+      # import: when this engine goes, only the harness changes. When
+      # v46 becomes untenable, repoint this job at whatever runs
+      # shared-memory wasm next rather than trying to keep it alive.
       - name: Install wasmtime
         run: |
-          curl -sSf https://wasmtime.dev/install.sh | bash
+          curl -sSf https://wasmtime.dev/install.sh | bash -s -- --version v46.0.0
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+          "$HOME/.wasmtime/bin/wasmtime" --version
 
       - name: Run the cluster on shared memory
         env:
