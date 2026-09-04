@@ -281,7 +281,7 @@ else in the family is portable Rust and builds anywhere.
 | wasm32 | ❌ panic stub | no switchable stack exists |
 
 iOS needs nothing special: `aarch64-apple-ios` is `target_arch =
-"aarch64"` and not Windows, so it takes the same AAPCS64 switch and
+"aarch64"`, so it takes the same AAPCS64 switch and
 `mmap` guard-page stack as macOS, which CI exercises natively.
 
 Targets without a switch are not stuck. `krio_fiber::set_suspender`
