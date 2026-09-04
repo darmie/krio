@@ -55,17 +55,36 @@
 //! fiber. Which is exactly the failure this stub exists to prevent, so
 //! the switch was reverted rather than shipped.
 //!
-//! What the evidence points at, for whoever picks this up: the asm
-//! blocks carry no SEH unwind data. On x64 a function without `.pdata`
-//! unwinds as a leaf with the return address at `[rsp]`, which happens
-//! to be survivable; ARM64 Windows makes no such accommodation, and a
-//! frame that adjusts `sp` by 192 without `.seh_` directives will
-//! mislead any walk that passes through it. The suspect is therefore
-//! `.seh_proc` / `.seh_endprologue` / `.seh_endproc` on both
-//! `krio_fiber_switch` and the trampoline, not the TEB pair. Note the
-//! phase-1 handler search may walk *past* `fiber_run`'s `catch_unwind`
-//! before deciding, which would explain why only the panicking tests
-//! fail while every other switch works.
+//! Why debug passes and release does not is **not established**. One CI
+//! run is one data point, and the mechanism was never instrumented.
+//! Three candidates, with what argues for and against each:
+//!
+//! 1. **Inlining changes where the unwind walk ends up.** Debug keeps
+//!    real frames between the panic and `fiber_run`'s `catch_unwind`;
+//!    release collapses the closure into it. If the phase-1 handler
+//!    search reaches one frame further in release it meets the naked
+//!    trampoline and the synthetic bottom frame — and neither asm block
+//!    here carries `.pdata`. On x64 a function without unwind data
+//!    unwinds as a leaf with the return address at `[rsp]`, which the
+//!    synthetic frame happens to populate; ARM64's leaf fallback takes
+//!    it from `x30`, which at that point holds whatever the switch
+//!    left. This is the only candidate that explains both the
+//!    architecture difference and the profile difference.
+//! 2. **Stack exhaustion.** Windows fiber stacks are a plain
+//!    `Box<[u8]>` with no guard page (see `super::stack`) and default
+//!    to 64 KB; panic and unwinder machinery is stack-hungry, and an
+//!    overrun would corrupt the heap rather than trap. It explains why
+//!    only the panicking tests fail — but it argues the wrong way on
+//!    profile, since debug frames are larger and debug passed.
+//! 3. **Packed `.pdata`.** ARM64 Windows permits a compact unwind
+//!    encoding for simple prologues, which release code is likelier to
+//!    qualify for. Least likely; it would be a codegen bug.
+//!
+//! Each is one CI run to discriminate: raise the panic tests'
+//! `with_stack_size` to 1 MB (tests 2), build release at
+//! `-C opt-level=1` (tests 1), or add `.seh_proc` /
+//! `.seh_endprologue` / `.seh_endproc` to both asm blocks (tests 1
+//! directly). Do that before writing any more assembly.
 //!
 //! Debug passing is not evidence of correctness here; it is the same
 //! trap as before, one optimisation level lower.
