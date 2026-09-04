@@ -42,32 +42,43 @@ use crate::park::Park;
 
 /// Cluster-wide stop-the-world state.
 pub(crate) struct Safepoint {
-    /// Someone wants the world stopped. Read on the hot path, so
+    /// Round counter and pending flag in one word: **odd means a stop is
+    /// pending**, and every release bumps it to the next even value.
+    ///
+    /// These were two fields once — a `requested` flag and a
+    /// `generation` — and that could not be made correct. A release has
+    /// to move the generation *before* clearing the flag, or an agent
+    /// still on its way in waits on a release that already happened; but
+    /// then an agent leaving the barrier can re-read the not-yet-cleared
+    /// flag, walk straight back in against the *new* generation, and
+    /// wait for a release that will never come. Clearing the flag first
+    /// just swaps which of the two hangs. One word has no such window:
+    /// an agent snapshots it once, and every question — is a stop
+    /// pending, is it still *this* stop — is answered by that snapshot.
+    ///
+    /// Read on the hot path, so [`Safepoint::requested`] reads it
     /// relaxed: a late observation costs one more loop iteration, and
     /// the barrier is what enforces correctness.
-    requested: AtomicBool,
+    state: AtomicU32,
     /// Agents currently waiting at the barrier.
     stopped: AtomicU32,
-    /// Bumped once per release. Agents park on *this* rather than on the
-    /// flag, so a stop/resume pair that lands while an agent is on its
-    /// way in cannot leave it asleep against a flag that already went
-    /// back to false.
-    generation: AtomicU32,
 }
+
+/// Low bit of [`Safepoint::state`]: a stop is pending.
+const PENDING: u32 = 1;
 
 impl Safepoint {
     pub(crate) const fn new() -> Self {
         Self {
-            requested: AtomicBool::new(false),
+            state: AtomicU32::new(0),
             stopped: AtomicU32::new(0),
-            generation: AtomicU32::new(0),
         }
     }
 
     /// Is a stop pending? One relaxed load — this is the hot-loop poll.
     #[inline]
     pub(crate) fn requested(&self) -> bool {
-        self.requested.load(Ordering::Relaxed)
+        self.state.load(Ordering::Relaxed) & PENDING == PENDING
     }
 
     /// How many agents are waiting at the barrier.
@@ -78,26 +89,46 @@ impl Safepoint {
     /// Ask for a stop. Returns `false` if one was already pending, so
     /// two hosts cannot both think they own the world.
     pub(crate) fn request(&self) -> bool {
-        self.requested
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & PENDING == PENDING {
+                return false;
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(seen) => state = seen,
+            }
+        }
     }
 
     /// Wait here until the world resumes, counting this agent as safe
     /// for as long as it does.
     ///
-    /// Reads the generation *before* announcing, so a release that lands
-    /// between the two is seen as a generation change rather than
-    /// slept through.
+    /// Snapshots the state *before* announcing. Everything after keys
+    /// off that snapshot, so a release landing at any point is seen as
+    /// the state moving on rather than slept through.
     pub(crate) fn enter<P: Park>(&self, parker: &P) {
-        let generation = self.generation.load(Ordering::Acquire);
+        let state = self.state.load(Ordering::Acquire);
+        if state & PENDING != PENDING {
+            // Released before we arrived. Joining now would count this
+            // agent into a round it is not part of.
+            return;
+        }
+
         self.stopped.fetch_add(1, Ordering::AcqRel);
         // Wake anyone spinning on the count — the last arrival is what
         // completes the barrier.
         parker.unpark_all(&self.stopped);
 
-        while self.generation.load(Ordering::Acquire) == generation {
-            parker.park(&self.generation, generation);
+        if self.state.load(Ordering::Acquire) == state {
+            while self.state.load(Ordering::Acquire) == state {
+                parker.park(&self.state, state);
+            }
         }
 
         self.stopped.fetch_sub(1, Ordering::AcqRel);
@@ -107,11 +138,6 @@ impl Safepoint {
 
     /// Let everyone go, and wait for the barrier to empty.
     ///
-    /// The generation moves before the flag clears: an agent still on
-    /// its way to the barrier must find a *changed generation* rather
-    /// than a cleared flag, or it would wait for a release that already
-    /// happened.
-    ///
     /// Draining before returning is not tidiness, it is correctness.
     /// Agents decrement on their way out, which happens *after* they
     /// observe the release — so a second `stop_the_world` that started
@@ -120,19 +146,35 @@ impl Safepoint {
     /// several agents are still writing to. Found by a test that ran
     /// twenty stops back to back.
     ///
+    /// A no-op when no stop is pending, so `shutdown` can call it
+    /// unconditionally without leaving one behind.
+    ///
     /// Gives up if `stopping` is set: agents on their way out of a
     /// shutdown will not all come back to be counted.
     pub(crate) fn release<P: Park>(&self, parker: &P, stopping: &AtomicBool) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        self.requested.store(false, Ordering::Release);
-        parker.unpark_all(&self.generation);
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & PENDING != PENDING {
+                return;
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(seen) => state = seen,
+            }
+        }
+        parker.unpark_all(&self.state);
 
         loop {
             let waiting = self.stopped.load(Ordering::Acquire);
             if waiting == 0 || stopping.load(Ordering::Acquire) {
                 return;
             }
-            parker.unpark_all(&self.generation);
+            parker.unpark_all(&self.state);
             // Park rather than spin. A hard spin here is not merely
             // wasteful: on a machine with more runnable threads than
             // cores it holds a core against the very agents it is
@@ -190,15 +232,42 @@ mod tests {
     }
 
     #[test]
-    fn releasing_moves_the_generation() {
+    fn releasing_moves_the_state() {
         let sp = Safepoint::new();
-        let before = sp.generation.load(Ordering::Acquire);
+        let before = sp.state.load(Ordering::Acquire);
         sp.request();
         sp.release(&SpinPark::default(), &AtomicBool::new(false));
         assert_ne!(
-            sp.generation.load(Ordering::Acquire),
+            sp.state.load(Ordering::Acquire),
             before,
-            "an agent parked on the old generation must see it move"
+            "an agent parked on the old state must see it move"
         );
+    }
+
+    #[test]
+    fn releasing_without_a_stop_leaves_no_stop_behind() {
+        // `shutdown` releases unconditionally. If that bumped the word
+        // anyway it would land on an odd value, and every agent would
+        // read a stop nobody asked for.
+        let sp = Safepoint::new();
+        sp.release(&SpinPark::default(), &AtomicBool::new(false));
+        assert!(!sp.requested());
+        sp.request();
+        sp.release(&SpinPark::default(), &AtomicBool::new(false));
+        sp.release(&SpinPark::default(), &AtomicBool::new(false));
+        assert!(!sp.requested(), "a second release must not re-arm one");
+    }
+
+    #[test]
+    fn entering_after_the_release_does_not_join_the_round() {
+        // The hang this word exists to prevent: an agent that reads the
+        // stop, is descheduled, and arrives once it is already over must
+        // walk straight back out rather than wait on a release that has
+        // been and gone.
+        let sp = Safepoint::new();
+        sp.request();
+        sp.release(&SpinPark::default(), &AtomicBool::new(false));
+        sp.enter(&SpinPark::default()); // returns, or the test hangs
+        assert_eq!(sp.stopped_count(), 0, "and is not counted into the next");
     }
 }

@@ -233,9 +233,11 @@ fn a_hot_loop_reaches_the_barrier_by_polling() {
         cluster: Arc<Cluster<YieldPark, StdClock>>,
         polled: Arc<AtomicUsize>,
         stop: Arc<AtomicBool>,
+        entered: Arc<AtomicBool>,
     }
     impl Task for HotLoop {
         fn step(&mut self) -> Suspension {
+            self.entered.store(true, Ordering::Release);
             // A game loop: milliseconds inside one step, never returning
             // to the scheduler on its own.
             while !self.stop.load(Ordering::Relaxed) {
@@ -253,6 +255,7 @@ fn a_hot_loop_reaches_the_barrier_by_polling() {
     let cluster = Arc::new(Cluster::new(2, YieldPark, clock()));
     let polled = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
 
     cluster.spawn_on(
         AgentId(1),
@@ -260,6 +263,7 @@ fn a_hot_loop_reaches_the_barrier_by_polling() {
             cluster: Arc::clone(&cluster),
             polled: Arc::clone(&polled),
             stop: Arc::clone(&stop),
+            entered: Arc::clone(&entered),
         }),
     );
 
@@ -267,7 +271,19 @@ fn a_hot_loop_reaches_the_barrier_by_polling() {
         let c = Arc::clone(&cluster);
         thread::spawn(move || c.run(AgentId(1)))
     };
-    thread::sleep(Duration::from_millis(20));
+
+    // Wait for the task to actually be inside its loop rather than
+    // sleeping and hoping. If the stop request lands first the agent is
+    // still idle, reaches the barrier through `run`'s own check, and
+    // never polls — so `polled` stays 0 and the assertion below fires.
+    // That panic then skips the cleanup underneath it, leaving the
+    // worker spinning on `!stop` forever, and the process hangs instead
+    // of failing. Cheap to wait; expensive to guess.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !entered.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "hot loop never started");
+        thread::yield_now();
+    }
 
     // Without the poll this would hang: the agent is inside one step and
     // nothing can interrupt it.

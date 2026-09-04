@@ -541,10 +541,16 @@ impl<P: Park, C: Clock + Sync> ParallelScheduler for Cluster<P, C> {
             // A main agent must not block, so it leaves instead and its
             // host resumes driving once the world does.
             if self.safepoint.requested() {
-                if role == AgentRole::Worker {
-                    self.safepoint.enter(&self.parker);
-                } else {
+                if role != AgentRole::Worker {
                     break;
+                }
+                // Loop rather than enter once. `enter` returns straight
+                // away for a round that ended before this agent reached
+                // it, and going on to step a task with a *new* stop
+                // already pending is the thing the barrier exists to
+                // prevent. `run` gets this from its own `continue`.
+                while self.safepoint.requested() {
+                    self.safepoint.enter(&self.parker);
                 }
             }
 
