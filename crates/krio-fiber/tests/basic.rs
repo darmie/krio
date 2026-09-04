@@ -526,6 +526,12 @@ fn saved_fp_points_into_fiber_stack_when_suspended() {
 }
 
 #[test]
+// The `*fp -> caller's fp` walk below is an x86 / x86_64 / AArch64
+// convention. RISC-V puts the frame pointer at the CFA and the chain
+// link at `[s0 - 16]`, so walking `[s0]` there reads a saved register,
+// not a link — a different traversal, not a broken one. See
+// `Fiber::saved_fp` for what each ABI actually guarantees.
+#[cfg(not(target_arch = "riscv64"))]
 fn saved_fp_chain_terminates_cleanly() {
     // Walk the frame chain from the fiber's saved_fp and verify
     // every step decreases (frames grow downward) or hits null.

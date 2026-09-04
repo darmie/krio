@@ -52,7 +52,7 @@ tasks (per-fiber stack, but suspension Just Works).
 | `krio-core`      | ✅ shipped          |
 | `krio-runtime`   | ✅ shipped — RoundRobin scheduler |
 | `krio-stackless` | ✅ shipped — CooperativeExecutor + WakerExecutor |
-| `krio-fiber`     | ✅ shipped — Fiber on x86_64 (SysV + MS x64) + aarch64 (non-Windows); host-routed `yield_now` elsewhere |
+| `krio-fiber`     | ✅ shipped — Fiber on x86_64 (SysV + MS x64), aarch64 (non-Windows), x86-32 (SysV) and riscv64 (RV64GC); host-routed `yield_now` elsewhere |
 | `krio-async`     | ✅ Phase 3 v2 — direct-yield + captures lift + cross-fn dispatch + multi-suspension blocks |
 | `krio-preempt`   | 🟨 v1 — TimeSliceScheduler (cooperative slicing); real signal preempt deferred |
 | `krio-parallel`  | 🟨 v1 — Cluster: bounded Chase–Lev deques, injector overflow, role-derived budgets, waker registry, stop-the-world safepoints. Needs a `Park` backend per target |
@@ -271,3 +271,27 @@ polls `world_is_stopped()`, and calls `resume_world()` when finished.
 ## License
 
 MIT OR Apache-2.0 (see [LICENSE](LICENSE)).
+## Architecture support
+
+`krio-fiber` needs a context switch per (architecture, ABI). Everything
+else in the family is portable Rust and builds anywhere.
+
+| arch / ABI | fibers | verified by |
+|---|---|---|
+| x86_64 SysV (Linux, macOS) | ✅ | native CI, both profiles |
+| x86_64 MS x64 (Windows) | ✅ | native CI, both profiles |
+| aarch64 (Linux, macOS, **iOS**) | ✅ | native CI, both profiles |
+| **x86-32 SysV** (i686) | ✅ | qemu / 32-bit compat, both profiles |
+| **riscv64 (RV64GC)** | ✅ | qemu-riscv64, both profiles |
+| aarch64 Windows | ❌ panic stub | needs the TEB swap; see `arch.rs` |
+| wasm32 | ❌ panic stub | no switchable stack exists |
+
+iOS needs nothing special: `aarch64-apple-ios` is `target_arch =
+"aarch64"` and not Windows, so it takes the same AAPCS64 switch and
+`mmap` guard-page stack as macOS, which CI exercises natively.
+
+Targets without a switch are not stuck. `krio_fiber::set_suspender`
+routes `yield_now` to a host suspender there, and the rest of the family
+— including `krio-parallel`, which is `no_std` and never spawns a thread
+of its own — works regardless. A single-agent cluster driven by
+`drive_once` needs no threading support at all.

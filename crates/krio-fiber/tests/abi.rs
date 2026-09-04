@@ -398,6 +398,23 @@ fn guard_page_traps_on_stack_overflow() {
         .output()
         .expect("spawn guard-page child probe");
 
+    // The child is this same binary, re-executed. Under a user-mode
+    // emulator (qemu-riscv64 and friends) the host kernel cannot launch
+    // a foreign-architecture ELF without a binfmt registration, so the
+    // spawn fails outright with 127 and the probe never ran. That says
+    // nothing about the guard page either way, so skip rather than
+    // report a failure that is really about the harness.
+    //
+    // A genuine miss looks different: the child runs and exits
+    // normally, printing one of its own NO_TRAP lines.
+    if out.status.code() == Some(127) {
+        eprintln!(
+            "skipping guard-page probe: cannot re-exec self \
+             (emulated target without binfmt?)"
+        );
+        return;
+    }
+
     // SIGSEGV is 11 everywhere; SIGBUS is 7 on Linux and 10 on Darwin.
     // Darwin reports a guard-page hit as SIGBUS.
     let signal = out.status.signal();

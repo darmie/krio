@@ -43,10 +43,20 @@
 //! swap is a pair of `ldr`/`str` through `x18` instead of the
 //! `gs:`-relative moves used on x64.
 
-#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows))))]
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", not(windows)),
+    target_arch = "riscv64",
+    all(target_arch = "aarch64", not(windows))
+))]
 use core::arch::global_asm;
 
-#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows))))]
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", not(windows)),
+    target_arch = "riscv64",
+    all(target_arch = "aarch64", not(windows))
+))]
 unsafe extern "C" {
     /// Save the current context onto the current stack, then switch
     /// to the context whose stack pointer is at `*load_from`. Writes
@@ -193,6 +203,142 @@ global_asm!(
     options(att_syntax)
 );
 
+// SysV i386 (x86-32), non-Windows. Two things differ from x86_64 and
+// both matter:
+//
+//   * **Arguments arrive on the stack**, not in registers: at entry
+//     `4(%esp)` is `save_to` and `8(%esp)` is `load_from`, above the
+//     return address. They must be read into registers *before* the
+//     first push, because every push moves the stack they sit on.
+//   * The callee-saved set is only {ebx, esi, edi, ebp}. As on x86_64
+//     the MXCSR control bits and the x87 control word are callee-saved
+//     (i386 psABI §2.2.1), so the frame carries them too — and unlike
+//     x86_64 this target genuinely still has an x87 stack in play.
+//
+// Saved frame, low → high address, from the saved sp:
+//   sp+0   : MXCSR   (4 bytes)
+//   sp+4   : x87 CW  (2 bytes, 2 of pad)
+//   sp+8   : edi
+//   sp+12  : esi
+//   sp+16  : ebx     — carries the TrampolineState on first entry
+//   sp+20  : ebp
+//   sp+24  : return address pushed by the `call`
+#[cfg(all(target_arch = "x86", not(windows)))]
+global_asm!(
+    r#"
+    .global _krio_fiber_switch
+    .global krio_fiber_switch
+    _krio_fiber_switch:
+    krio_fiber_switch:
+        mov    4(%esp), %eax
+        mov    8(%esp), %edx
+        push   %ebp
+        push   %ebx
+        push   %esi
+        push   %edi
+        sub    $8, %esp
+        stmxcsr (%esp)
+        fnstcw  4(%esp)
+        mov    %esp, (%eax)
+        mov    (%edx), %esp
+        ldmxcsr (%esp)
+        fldcw   4(%esp)
+        add    $8, %esp
+        pop    %edi
+        pop    %esi
+        pop    %ebx
+        pop    %ebp
+        ret
+    "#,
+    options(att_syntax)
+);
+
+// RISC-V RV64GC, LP64D. Callee-saved is {ra, s0-s11} plus {fs0-fs11}
+// under the D extension, and s0 doubles as the frame pointer — so it
+// sits at a fixed offset a GC walker can find, exactly like x29 on
+// AArch64.
+//
+// `fcsr` rides the frame as well. The psABI does not list it as
+// callee-saved, but restoring the *incoming* context's rounding mode
+// and exception flags is right under either reading: a context that
+// set a rounding mode before yielding should still have it on resume.
+// It costs two instructions.
+//
+// Saved frame, low → high address, from the saved sp:
+//   sp+0   : ra            — return address, i.e. the resume point
+//   sp+8   : s0 / fp
+//   sp+16  : s1            — carries the TrampolineState on first entry
+//   sp+24  : s2..s11       (10 × 8)
+//   sp+104 : fs0..fs11     (12 × 8)
+//   sp+200 : fcsr (4 bytes, 4 of pad)
+//   total  : 208, a multiple of 16 as the ABI requires
+#[cfg(target_arch = "riscv64")]
+global_asm!(
+    r#"
+    .global krio_fiber_switch
+    krio_fiber_switch:
+        addi  sp, sp, -208
+        sd    ra,  0(sp)
+        sd    s0,  8(sp)
+        sd    s1,  16(sp)
+        sd    s2,  24(sp)
+        sd    s3,  32(sp)
+        sd    s4,  40(sp)
+        sd    s5,  48(sp)
+        sd    s6,  56(sp)
+        sd    s7,  64(sp)
+        sd    s8,  72(sp)
+        sd    s9,  80(sp)
+        sd    s10, 88(sp)
+        sd    s11, 96(sp)
+        fsd   fs0,  104(sp)
+        fsd   fs1,  112(sp)
+        fsd   fs2,  120(sp)
+        fsd   fs3,  128(sp)
+        fsd   fs4,  136(sp)
+        fsd   fs5,  144(sp)
+        fsd   fs6,  152(sp)
+        fsd   fs7,  160(sp)
+        fsd   fs8,  168(sp)
+        fsd   fs9,  176(sp)
+        fsd   fs10, 184(sp)
+        fsd   fs11, 192(sp)
+        frcsr t0
+        sw    t0, 200(sp)
+        sd    sp, 0(a0)
+        ld    sp, 0(a1)
+        ld    ra,  0(sp)
+        ld    s0,  8(sp)
+        ld    s1,  16(sp)
+        ld    s2,  24(sp)
+        ld    s3,  32(sp)
+        ld    s4,  40(sp)
+        ld    s5,  48(sp)
+        ld    s6,  56(sp)
+        ld    s7,  64(sp)
+        ld    s8,  72(sp)
+        ld    s9,  80(sp)
+        ld    s10, 88(sp)
+        ld    s11, 96(sp)
+        fld   fs0,  104(sp)
+        fld   fs1,  112(sp)
+        fld   fs2,  120(sp)
+        fld   fs3,  128(sp)
+        fld   fs4,  136(sp)
+        fld   fs5,  144(sp)
+        fld   fs6,  152(sp)
+        fld   fs7,  160(sp)
+        fld   fs8,  168(sp)
+        fld   fs9,  176(sp)
+        fld   fs10, 184(sp)
+        fld   fs11, 192(sp)
+        lw    t0, 200(sp)
+        fscsr t0
+        addi  sp, sp, 208
+        ret
+    "#
+);
+
 // AAPCS64, non-Windows. ARM64 Windows deliberately falls through to
 // the unsupported arm below — see the module docs.
 #[cfg(all(target_arch = "aarch64", not(windows)))]
@@ -262,7 +408,12 @@ global_asm!(
 //
 // `krio_fiber_switch` compiles but panics if actually invoked; the
 // layout constants are inert zeros.
-#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", not(windows)),
+    target_arch = "riscv64",
+    all(target_arch = "aarch64", not(windows))
+)))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn krio_fiber_switch(_save_to: *mut *mut u8, _load_from: *const *mut u8) {
     panic!(
@@ -283,6 +434,12 @@ pub const SAVED_FRAME_BYTES: usize = 8 * 8 + 10 * 16 + 16 + 16; // GP + xmm + TE
 #[cfg(all(target_arch = "aarch64", not(windows)))]
 pub const SAVED_FRAME_BYTES: usize = 192; // 12 GP + 8 FP regs + FPCR + alignment pad
 
+#[cfg(all(target_arch = "x86", not(windows)))]
+pub const SAVED_FRAME_BYTES: usize = 4 * 4 + 8; // ebp, ebx, esi, edi + MXCSR/x87 CW
+
+#[cfg(target_arch = "riscv64")]
+pub const SAVED_FRAME_BYTES: usize = 208; // ra + 12 s-regs + 12 fs-regs + fcsr + pad
+
 /// Byte offset, from a suspended fiber's [`super::Fiber::saved_sp`],
 /// of the saved frame-pointer register (`rbp` on x86_64, `x29` on
 /// aarch64). The suspended fiber's stack frame chain starts at
@@ -296,6 +453,14 @@ pub const SAVED_FP_OFFSET: usize = 232; // FP ctl, xmm6..xmm15, r15..r12, rsi, r
 
 #[cfg(all(target_arch = "aarch64", not(windows)))]
 pub const SAVED_FP_OFFSET: usize = 80; // x29 lives at sp+80 (see stp pair)
+
+#[cfg(all(target_arch = "x86", not(windows)))]
+pub const SAVED_FP_OFFSET: usize = 20; // MXCSR/CW pad, edi, esi, ebx, then ebp
+
+// s0 is RISC-V's frame pointer, and the switch parks it directly above
+// the saved ra.
+#[cfg(target_arch = "riscv64")]
+pub const SAVED_FP_OFFSET: usize = 8;
 
 /// Byte offset of the saved return address (instruction at which the
 /// fiber will resume execution after the next context switch). On
@@ -311,11 +476,34 @@ pub const SAVED_RET_OFFSET: usize = 256; // ret_addr sits above the full 256-byt
 #[cfg(all(target_arch = "aarch64", not(windows)))]
 pub const SAVED_RET_OFFSET: usize = 88; // x30 lives at sp+88 (companion of x29)
 
+#[cfg(all(target_arch = "x86", not(windows)))]
+pub const SAVED_RET_OFFSET: usize = 24; // ret_addr sits above the 24-byte frame
+
+// RISC-V keeps the return address in a register, so the switch spills
+// `ra` to the very bottom of its frame rather than above it.
+#[cfg(target_arch = "riscv64")]
+pub const SAVED_RET_OFFSET: usize = 0;
+
 // Inert layout constants for targets without a native context switch — the
 // fiber path is never entered at runtime on these (see `krio_fiber_switch`).
-#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", not(windows)),
+    target_arch = "riscv64",
+    all(target_arch = "aarch64", not(windows))
+)))]
 pub const SAVED_FRAME_BYTES: usize = 0;
-#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", not(windows)),
+    target_arch = "riscv64",
+    all(target_arch = "aarch64", not(windows))
+)))]
 pub const SAVED_FP_OFFSET: usize = 0;
-#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", not(windows)),
+    target_arch = "riscv64",
+    all(target_arch = "aarch64", not(windows))
+)))]
 pub const SAVED_RET_OFFSET: usize = 0;

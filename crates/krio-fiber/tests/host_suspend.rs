@@ -14,7 +14,12 @@
 //!   cargo test -p krio-fiber --target wasm32-wasip1 --test host_suspend
 //! ```
 
-#![cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
+#![cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", not(windows)),
+    target_arch = "riscv64",
+    all(target_arch = "aarch64", not(windows))
+)))]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -87,5 +87,10 @@ pub use fiber::{
 // docs on `set_suspender`. Re-exported separately so the symbol simply
 // does not appear on a target that switches its own stack, rather than
 // appearing and panicking.
-#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", not(windows)),
+    target_arch = "riscv64",
+    all(target_arch = "aarch64", not(windows))
+)))]
 pub use fiber::{has_suspender, set_suspender};

@@ -156,6 +156,69 @@ jobs:
             -p krio-core -p krio-runtime -p krio-stackless \
             -p krio-async -p krio-parallel -p krio-wasm
 
+  # Architectures without a native runner here. The context switch is
+  # per-(arch, ABI) assembly, and compiling it proves almost nothing —
+  # a switch that assembles and then drops a callee-saved register is
+  # exactly the failure this project has shipped before. So these run
+  # the real krio-fiber suite under qemu-user.
+  #
+  # aarch64 is absent on purpose: it has native rows in the matrix above.
+  emulated:
+    name: Emulated ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: i686 (x86-32 SysV)
+            target: i686-unknown-linux-gnu
+            gcc: gcc-i686-linux-gnu
+            linker: i686-linux-gnu-gcc
+            qemu: qemu-i386
+            sysroot: /usr/i686-linux-gnu
+          - name: riscv64 (RV64GC)
+            target: riscv64gc-unknown-linux-gnu
+            gcc: gcc-riscv64-linux-gnu
+            linker: riscv64-linux-gnu-gcc
+            qemu: qemu-riscv64
+            sysroot: /usr/riscv64-linux-gnu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "${{ matrix.target }}"
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Install cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ${{ matrix.gcc }} qemu-user
+
+      # Both profiles, for the same reason the native matrix runs both:
+      # register allocation and spill choices differ at opt-level 3, and
+      # a switch bug that debug-mode stack traffic hides can surface
+      # only in release.
+      # Note what is deliberately *not* set here: no
+      # CARGO_TARGET_<TRIPLE>_RUSTFLAGS. That key replaces
+      # `build.rustflags` rather than merging with it, so setting it
+      # would silently drop `-Cforce-frame-pointers=yes` from
+      # .cargo/config.toml — and `Fiber::saved_fp` then returns null,
+      # failing the GC-introspection tests for a reason that has nothing
+      # to do with the switch. Learned the hard way while bringing these
+      # two ports up.
+      - name: Run tests
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          triple=$(echo "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
+          export "CARGO_TARGET_${triple}_LINKER=${{ matrix.linker }}"
+          export "CARGO_TARGET_${triple}_RUNNER=${{ matrix.qemu }} -L ${{ matrix.sysroot }}"
+          cargo test --workspace
+          cargo test --workspace --release
+
   # Compiling the atomics path is not the same as it working. This job
   # executes the cluster on a real engine with a real shared memory:
   # several agents over one linear memory, parking on

@@ -127,7 +127,12 @@ struct TrampolineState {
     // (see `crate::arch` for which those are — note aarch64-windows is
     // deliberately among them).
     #[cfg_attr(
-        not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))),
+        not(any(
+            target_arch = "x86_64",
+            all(target_arch = "x86", not(windows)),
+            target_arch = "riscv64",
+            all(target_arch = "aarch64", not(windows))
+        )),
         allow(dead_code)
     )]
     closure: Option<Box<dyn FnOnce()>>,
@@ -453,6 +458,23 @@ impl Fiber {
     /// owned stack and is valid for as long as the `Fiber` lives. The
     /// caller is responsible for any unsafety in dereferencing it
     /// (e.g. interpreting stack contents for GC root scanning).
+    /// # The chain link is not at `*fp` on every ABI
+    ///
+    /// Walking `fp -> *fp` to reach the caller's frame is an x86,
+    /// x86_64 and AArch64 convention, and a walker that assumes it is
+    /// universal reads garbage elsewhere:
+    ///
+    /// * **RISC-V** puts `s0` at the CFA — the *top* of the frame — and
+    ///   the previous frame pointer at `[s0 - 16]`, with the return
+    ///   address at `[s0 - 8]`.
+    /// * **Windows x64** maintains no linked frame chain at all. It
+    ///   unwinds through its own tables, and `rbp` may be established
+    ///   at an offset inside the frame or used as a general register.
+    ///
+    /// The pointer this returns is the ABI's frame-pointer register
+    /// either way; what differs is how to take a step from it. A
+    /// walker should also bound itself to [`Fiber::stack_range`] rather
+    /// than trusting the chain to terminate.
     pub fn saved_fp(&self) -> Option<*const u8> {
         if !matches!(self.state(), FiberState::Suspended) {
             return None;
@@ -545,7 +567,12 @@ impl Fiber {
 ///
 /// # Panics
 /// Panics if called outside of a fiber (i.e. from the host thread).
-#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows))))]
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", not(windows)),
+    target_arch = "riscv64",
+    all(target_arch = "aarch64", not(windows))
+))]
 pub fn yield_now() {
     let state_ptr = ACTIVE_TRAMPOLINE.with(|cell| cell.get());
     assert!(
@@ -708,7 +735,12 @@ pub fn should_yield_early() -> bool {
 /// Only reachable on targets without a native context switch — a target
 /// that can switch its own stack has no use for a host suspend, and
 /// should not carry the indirection.
-#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", not(windows)),
+    target_arch = "riscv64",
+    all(target_arch = "aarch64", not(windows))
+)))]
 static SUSPENDER: AtomicUsize = AtomicUsize::new(0);
 
 /// Install the host's suspend operation, for targets that cannot
@@ -747,7 +779,12 @@ static SUSPENDER: AtomicUsize = AtomicUsize::new(0);
 /// suspend that silently does nothing would turn a yield point into a
 /// no-op and change what the program means; an unsupported operation
 /// should fail where it is unsupported.
-#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", not(windows)),
+    target_arch = "riscv64",
+    all(target_arch = "aarch64", not(windows))
+)))]
 pub fn set_suspender(suspend: fn()) {
     SUSPENDER.store(suspend as usize, Ordering::Release);
 }
@@ -756,7 +793,12 @@ pub fn set_suspender(suspend: fn()) {
 ///
 /// Worth checking at start-up so a host can refuse deliberately instead
 /// of discovering it at the first yield point.
-#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", not(windows)),
+    target_arch = "riscv64",
+    all(target_arch = "aarch64", not(windows))
+)))]
 pub fn has_suspender() -> bool {
     SUSPENDER.load(Ordering::Acquire) != 0
 }
@@ -771,7 +813,12 @@ pub fn has_suspender() -> bool {
 ///
 /// # Panics
 /// If no suspender is installed. See [`set_suspender`].
-#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", not(windows)),
+    target_arch = "riscv64",
+    all(target_arch = "aarch64", not(windows))
+)))]
 pub fn yield_now() {
     let installed = SUSPENDER.load(Ordering::Acquire);
     assert!(
@@ -893,13 +940,13 @@ unsafe fn prepare_initial_stack(stack: &mut [u8], state: *mut TrampolineState) -
 /// the CRT both install. **Must not be left as zero** — a zero MXCSR
 /// unmasks every SSE exception, so the first denormal or inexact
 /// result inside a brand-new fiber would raise SIGFPE.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 const DEFAULT_MXCSR: u32 = 0x1F80;
 
 /// Default x87 control word: extended precision, round-to-nearest,
 /// all six x87 exceptions masked. Same reasoning as [`DEFAULT_MXCSR`]
 /// — zero here would unmask the x87 exception set.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 const DEFAULT_X87_CW: u16 = 0x037F;
 
 #[cfg(all(target_arch = "x86_64", not(windows)))]
@@ -1009,12 +1056,75 @@ unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) 
     sp
 }
 
-// Unsupported targets (wasm32, riscv64, aarch64-windows, …): no native
+#[cfg(all(target_arch = "x86", not(windows)))]
+unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) -> *mut u8 {
+    // i386 SysV saved-frame layout (low → high), mirroring the save
+    // path in `crate::arch`:
+    //   sp+0   : MXCSR            (4 bytes)
+    //   sp+4   : x87 control word (2 bytes, 2 of pad)
+    //   sp+8   : edi, esi, ebx, ebp
+    //   sp+24  : trampoline_addr (the saved return addr)
+    //
+    // `state` rides in the ebx slot (sp+16) — callee-saved, so the
+    // trampoline finds it there on first entry.
+    //
+    // Alignment: i386 SysV wants esp 16-byte aligned at a call site, so
+    // a callee entered by `call` sees `esp % 16 == 12`. Entering by
+    // `ret` off sp+24 leaves esp at sp+28, so sp = top-32 puts that at
+    // top-4 — the same residue, since `top` is 16-aligned.
+    let sp = unsafe { top.sub(SAVED_FRAME_BYTES + 8) };
+    unsafe {
+        core::ptr::write_bytes(sp, 0, SAVED_FRAME_BYTES);
+        // FP control state, seeded with the ABI defaults rather than
+        // zero — see DEFAULT_MXCSR. This target still has a live x87
+        // stack, so the control word matters more here than on x86_64.
+        (sp as *mut u32).write(DEFAULT_MXCSR);
+        (sp.add(4) as *mut u16).write(DEFAULT_X87_CW);
+        // Trampoline state for ebx.
+        (sp.add(16) as *mut usize).write(state as usize);
+        (sp.add(SAVED_RET_OFFSET) as *mut usize).write(fiber_trampoline_x86 as *const () as usize);
+    }
+    sp
+}
+
+#[cfg(target_arch = "riscv64")]
+unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) -> *mut u8 {
+    // RV64 saved-frame layout (low → high), mirroring `crate::arch`:
+    //   sp+0   : ra — the resume point, so the trampoline goes here
+    //   sp+8   : s0 / fp
+    //   sp+16  : s1 — carries `state` into the trampoline
+    //   sp+24  : s2..s11
+    //   sp+104 : fs0..fs11
+    //   sp+200 : fcsr
+    //
+    // No return address is pushed on RISC-V — `ret` jumps through `ra`
+    // — so unlike x86 there is no residue to correct for: `top` is
+    // 16-aligned and the 208-byte frame keeps it that way.
+    //
+    // Zeroing the fcsr slot is the right default here: round-to-nearest
+    // with no exception flags raised, the same reasoning as AArch64's
+    // all-zero FPCR rather than x86's MXCSR.
+    let sp = unsafe { top.sub(SAVED_FRAME_BYTES) };
+    unsafe {
+        core::ptr::write_bytes(sp, 0, SAVED_FRAME_BYTES);
+        (sp.add(SAVED_RET_OFFSET) as *mut usize)
+            .write(fiber_trampoline_riscv64 as *const () as usize);
+        (sp.add(16) as *mut usize).write(state as usize);
+    }
+    sp
+}
+
+// Unsupported targets (wasm32, aarch64-windows, …): no native
 // stack to lay out. Compiles so the crate builds where it is pulled in
 // transitively. Note this panics from `Fiber::with_stack_size`, i.e.
 // `Fiber::new` itself fails loudly on these targets rather than handing
 // back a fiber that dies later.
-#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", not(windows)),
+    target_arch = "riscv64",
+    all(target_arch = "aarch64", not(windows))
+)))]
 unsafe fn prepare_initial_stack_arch(_top: *mut u8, _state: *mut TrampolineState) -> *mut u8 {
     panic!("krio-fiber: native fibers are unavailable on this target");
 }
@@ -1052,6 +1162,36 @@ unsafe extern "C" fn fiber_trampoline_x86_64() {
     )
 }
 
+#[cfg(all(target_arch = "x86", not(windows)))]
+#[unsafe(naked)]
+unsafe extern "C" fn fiber_trampoline_x86() {
+    // ebx holds the TrampolineState pointer (stashed in
+    // prepare_initial_stack_arch). i386 cdecl passes arguments on the
+    // stack, so it is pushed rather than moved into a register.
+    //
+    // The `sub` is alignment, not scratch space: entry leaves
+    // `esp % 16 == 12`, and pushing the one argument would land the
+    // `call` on a 4-aligned stack. Reserving 8 first makes esp
+    // 16-aligned at the call, so `fiber_run` sees the residue the ABI
+    // promises and any SSE spill it makes is aligned.
+    core::arch::naked_asm!(
+        "sub $8, %esp",
+        "push %ebx",
+        "call {f}",
+        "ud2",
+        f = sym fiber_run,
+        options(att_syntax),
+    )
+}
+
+#[cfg(target_arch = "riscv64")]
+#[unsafe(naked)]
+unsafe extern "C" fn fiber_trampoline_riscv64() {
+    // s1 holds the TrampolineState pointer; a0 is the first argument.
+    // `ebreak` on return — fiber_run never returns.
+    core::arch::naked_asm!("mv a0, s1", "call {f}", "ebreak", f = sym fiber_run)
+}
+
 #[cfg(all(target_arch = "aarch64", not(windows)))]
 #[unsafe(naked)]
 unsafe extern "C" fn fiber_trampoline_aarch64() {
@@ -1066,7 +1206,12 @@ unsafe extern "C" fn fiber_trampoline_aarch64() {
 /// runs the closure, marks the fiber done, and switches back to the
 /// caller. Never returns to its caller (the trampoline's tail).
 #[cfg_attr(
-    not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(windows)))),
+    not(any(
+        target_arch = "x86_64",
+        all(target_arch = "x86", not(windows)),
+        target_arch = "riscv64",
+        all(target_arch = "aarch64", not(windows))
+    )),
     allow(dead_code)
 )]
 extern "C" fn fiber_run(state_ptr: *mut TrampolineState) -> ! {
