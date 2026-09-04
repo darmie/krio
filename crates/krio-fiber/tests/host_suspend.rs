@@ -18,7 +18,7 @@
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    all(target_arch = "aarch64", not(windows))
+    target_arch = "aarch64"
 )))]
 
 use std::sync::atomic::{AtomicUsize, Ordering};

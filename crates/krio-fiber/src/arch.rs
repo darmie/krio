@@ -55,6 +55,14 @@
 //! fiber. Which is exactly the failure this stub exists to prevent, so
 //! the switch was reverted rather than shipped.
 //!
+//! ### Status: restored for the experiment, NOT fit to ship
+//!
+//! The switch below is currently compiled in again so the probe job in
+//! CI can measure it. It is **known to fail in release** — do not cut a
+//! release build for `aarch64-pc-windows-*` until the probe says
+//! otherwise. Debug is fine. If the experiment does not produce a fix,
+//! this goes back to the panic stub.
+//!
 //! The split is real, not an artefact of tests being skipped. The debug
 //! job ran `basic.rs` to "32 passed; 0 failed; 0 ignored; 0 filtered
 //! out", with `panicking_fiber_lands_in_errored_state` and
@@ -103,7 +111,7 @@
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    all(target_arch = "aarch64", not(windows))
+    target_arch = "aarch64"
 ))]
 use core::arch::global_asm;
 
@@ -111,7 +119,7 @@ use core::arch::global_asm;
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    all(target_arch = "aarch64", not(windows))
+    target_arch = "aarch64"
 ))]
 unsafe extern "C" {
     /// Save the current context onto the current stack, then switch
@@ -454,6 +462,72 @@ global_asm!(
     "#
 );
 
+// AAPCS64 on Windows. Same register set as the block above — the AArch64
+// procedure call standard is the same — plus the TEB stack-bounds swap
+// the MS x64 path does, and for the same reason: SEH refuses to unwind
+// past an `sp` outside `[StackLimit, StackBase]`, so without it the
+// first panic crossing a fiber boundary kills the process with the MS
+// C++ EH exit code 0xe06d7363.
+//
+// ARM64 Windows reaches the TEB through `x18` rather than a segment
+// register. Windows reserves x18 for exactly this, which is why the
+// AAPCS64 block above is already correct in never touching it. The
+// NT_TIB layout matches x64: StackBase at +0x08, StackLimit at +0x10.
+//
+// The frame is still 192 bytes. The non-Windows layout ends with FPCR
+// at 160 and 24 bytes of alignment padding; the two TEB slots move into
+// that padding rather than growing the frame, so SAVED_FP_OFFSET and
+// SAVED_RET_OFFSET are unchanged and a GC walker sees the same shape on
+// both AArch64 targets:
+//   sp+160 : FPCR
+//   sp+168 : TEB.StackLimit save slot
+//   sp+176 : TEB.StackBase  save slot
+//   sp+184 : pad
+#[cfg(all(target_arch = "aarch64", windows))]
+global_asm!(
+    r#"
+    .global krio_fiber_switch
+    krio_fiber_switch:
+        sub  sp, sp, #192
+        stp  x19, x20, [sp, #0]
+        stp  x21, x22, [sp, #16]
+        stp  x23, x24, [sp, #32]
+        stp  x25, x26, [sp, #48]
+        stp  x27, x28, [sp, #64]
+        stp  x29, x30, [sp, #80]
+        stp  d8,  d9,  [sp, #96]
+        stp  d10, d11, [sp, #112]
+        stp  d12, d13, [sp, #128]
+        stp  d14, d15, [sp, #144]
+        mrs  x9, fpcr
+        str  x9, [sp, #160]
+        ldr  x9,  [x18, #16]
+        ldr  x10, [x18, #8]
+        stp  x9, x10, [sp, #168]
+        mov  x9, sp
+        str  x9, [x0]
+        ldr  x9, [x1]
+        mov  sp, x9
+        ldp  x19, x20, [sp, #0]
+        ldp  x21, x22, [sp, #16]
+        ldp  x23, x24, [sp, #32]
+        ldp  x25, x26, [sp, #48]
+        ldp  x27, x28, [sp, #64]
+        ldp  x29, x30, [sp, #80]
+        ldp  d8,  d9,  [sp, #96]
+        ldp  d10, d11, [sp, #112]
+        ldp  d12, d13, [sp, #128]
+        ldp  d14, d15, [sp, #144]
+        ldr  x9, [sp, #160]
+        msr  fpcr, x9
+        ldp  x9, x10, [sp, #168]
+        str  x9,  [x18, #16]
+        str  x10, [x18, #8]
+        add  sp, sp, #192
+        ret
+    "#
+);
+
 // Unsupported targets: stack-based context switching has no
 // implementation. Two groups land here:
 //
@@ -476,7 +550,7 @@ global_asm!(
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    all(target_arch = "aarch64", not(windows))
+    target_arch = "aarch64"
 )))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn krio_fiber_switch(_save_to: *mut *mut u8, _load_from: *const *mut u8) {
@@ -495,7 +569,7 @@ pub const SAVED_FRAME_BYTES: usize = 6 * 8 + 16; // rbp, rbx, r12..r15 + MXCSR/x
 #[cfg(all(target_arch = "x86_64", windows))]
 pub const SAVED_FRAME_BYTES: usize = 8 * 8 + 10 * 16 + 16 + 16; // GP + xmm + TEB + FP ctl = 256
 
-#[cfg(all(target_arch = "aarch64", not(windows)))]
+#[cfg(target_arch = "aarch64")]
 pub const SAVED_FRAME_BYTES: usize = 192; // 12 GP + 8 FP regs + FPCR + alignment pad
 
 #[cfg(all(target_arch = "x86", not(windows)))]
@@ -515,7 +589,7 @@ pub const SAVED_FP_OFFSET: usize = 56; // MXCSR/CW pad, r15,r14,r13,r12,rbx then
 #[cfg(all(target_arch = "x86_64", windows))]
 pub const SAVED_FP_OFFSET: usize = 232; // FP ctl, xmm6..xmm15, r15..r12, rsi, rdi, rbx, rbp
 
-#[cfg(all(target_arch = "aarch64", not(windows)))]
+#[cfg(target_arch = "aarch64")]
 pub const SAVED_FP_OFFSET: usize = 80; // x29 lives at sp+80 (see stp pair)
 
 #[cfg(all(target_arch = "x86", not(windows)))]
@@ -537,7 +611,7 @@ pub const SAVED_RET_OFFSET: usize = 64; // ret_addr sits above the full 64-byte 
 #[cfg(all(target_arch = "x86_64", windows))]
 pub const SAVED_RET_OFFSET: usize = 256; // ret_addr sits above the full 256-byte frame
 
-#[cfg(all(target_arch = "aarch64", not(windows)))]
+#[cfg(target_arch = "aarch64")]
 pub const SAVED_RET_OFFSET: usize = 88; // x30 lives at sp+88 (companion of x29)
 
 #[cfg(all(target_arch = "x86", not(windows)))]
@@ -554,20 +628,20 @@ pub const SAVED_RET_OFFSET: usize = 0;
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    all(target_arch = "aarch64", not(windows))
+    target_arch = "aarch64"
 )))]
 pub const SAVED_FRAME_BYTES: usize = 0;
 #[cfg(not(any(
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    all(target_arch = "aarch64", not(windows))
+    target_arch = "aarch64"
 )))]
 pub const SAVED_FP_OFFSET: usize = 0;
 #[cfg(not(any(
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    all(target_arch = "aarch64", not(windows))
+    target_arch = "aarch64"
 )))]
 pub const SAVED_RET_OFFSET: usize = 0;

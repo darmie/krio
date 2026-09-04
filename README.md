@@ -277,7 +277,7 @@ else in the family is portable Rust and builds anywhere.
 | aarch64 (Linux, macOS, **iOS**) | ✅ | native CI, both profiles |
 | **x86-32 SysV** (i686) | ✅ | qemu / 32-bit compat, both profiles |
 | **riscv64 (RV64GC)** | ✅ | qemu-riscv64, both profiles |
-| aarch64 Windows | ❌ panic stub | TEB swap tried and insufficient; see `arch.rs` |
+| aarch64 Windows | ⚠️ under investigation | debug passes, release dies on panic; see `arch.rs` |
 | wasm32 | ❌ panic stub | no switchable stack exists |
 
 Two stubs remain. wasm32 has no switchable stack at all — see

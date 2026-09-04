@@ -230,6 +230,73 @@ jobs:
           cargo test --workspace
           cargo test --workspace --release
 
+  # One-off experiment, not a gate: it always exits 0 and exists to
+  # produce data rather than a verdict.
+  #
+  # The ARM64 Windows switch passes every test in debug and dies in
+  # release with 0xe06d7363 on the first panic crossing a fiber
+  # boundary. The release profile differs from debug in more than
+  # optimisation — debug-assertions, overflow-checks and debuginfo all
+  # change too — so toggling `--release` alone cannot say which of them
+  # is responsible. These four cases move one axis at a time:
+  #
+  #   A  release, opt=default  reproduce the failure
+  #   B  release, opt=1        is it optimisation, and at what level
+  #   C  release, opt=0        release settings, without optimisation
+  #   D  dev,     opt=3        optimisation, without release settings
+  #
+  # C and D are the pair that decides it. C passing and D failing means
+  # optimisation is the cause, and the suspect is the missing SEH unwind
+  # data on the asm blocks. C failing and D passing clears optimisation
+  # and points at something else in the release profile.
+  #
+  # Driven through CARGO_PROFILE_* rather than RUSTFLAGS deliberately:
+  # that key replaces `build.rustflags` instead of merging, and would
+  # silently drop `-Cforce-frame-pointers=yes` — moving a second
+  # variable and ruining the experiment.
+  arm64-windows-probe:
+    name: ARM64 Windows unwind probe
+    runs-on: windows-11-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Probe
+        shell: bash
+        run: |
+          set +e
+          T="-p krio-fiber --test basic"
+
+          echo "### A: release, opt=default"
+          cargo test $T --release > a.txt 2>&1; A=$?
+          tail -4 a.txt
+
+          echo "### B: release, opt=1"
+          CARGO_PROFILE_RELEASE_OPT_LEVEL=1 cargo test $T --release > b.txt 2>&1; B=$?
+          tail -4 b.txt
+
+          echo "### C: release, opt=0"
+          CARGO_PROFILE_RELEASE_OPT_LEVEL=0 cargo test $T --release > c.txt 2>&1; C=$?
+          tail -4 c.txt
+
+          echo "### D: dev, opt=3"
+          CARGO_PROFILE_DEV_OPT_LEVEL=3 cargo test $T > d.txt 2>&1; D=$?
+          tail -4 d.txt
+
+          r () { if [ "$1" = 0 ]; then echo PASS; else echo FAIL; fi; }
+          echo "================= PROBE SUMMARY ================="
+          echo "A  release opt=default : $(r $A)"
+          echo "B  release opt=1       : $(r $B)"
+          echo "C  release opt=0       : $(r $C)"
+          echo "D  dev     opt=3       : $(r $D)"
+          echo "================================================"
+          exit 0
+
   # Compiling the atomics path is not the same as it working. This job
   # executes the cluster on a real engine with a real shared memory:
   # several agents over one linear memory, parking on
