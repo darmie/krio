@@ -162,32 +162,38 @@ jobs:
             -p krio-core -p krio-runtime -p krio-stackless \
             -p krio-async -p krio-parallel -p krio-wasm
 
-  # Architectures without a native runner here. The context switch is
-  # per-(arch, ABI) assembly, and compiling it proves almost nothing —
-  # a switch that assembles and then drops a callee-saved register is
+  # Architectures with no hosted runner. The context switch is
+  # per-(arch, ABI) assembly, and compiling it proves almost nothing — a
+  # switch that assembles and then drops a callee-saved register is
   # exactly the failure this project has shipped before. So these run
-  # the real krio-fiber suite under qemu-user.
+  # the real suite.
   #
-  # aarch64 is absent on purpose: it has native rows in the matrix above.
-  emulated:
-    name: Emulated ${{ matrix.name }}
+  # aarch64 is absent on purpose: it has native rows in the matrix above,
+  # for both Linux and macOS.
+  #
+  # `gcc-<arch>-linux-gnu` is the compiler only — it carries no target
+  # libc, so without the matching `libc6-dev-*` the link dies on a
+  # missing Scrt1.o. That is what broke this job on its first run.
+  arch:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: i686 (x86-32 SysV)
+          # No emulator: 32-bit ELF runs natively on an x86_64 kernel,
+          # and rustc drives `cc -m32` for this target, so multilib is
+          # the whole requirement.
+          - name: i686 (x86-32 SysV, native)
             target: i686-unknown-linux-gnu
-            gcc: gcc-i686-linux-gnu
-            linker: i686-linux-gnu-gcc
-            qemu: qemu-i386
-            sysroot: /usr/i686-linux-gnu
-          - name: riscv64 (RV64GC)
+            packages: gcc-multilib
+            linker: ""
+            runner: ""
+          - name: riscv64 (RV64GC, qemu)
             target: riscv64gc-unknown-linux-gnu
-            gcc: gcc-riscv64-linux-gnu
+            packages: gcc-riscv64-linux-gnu libc6-dev-riscv64-cross qemu-user
             linker: riscv64-linux-gnu-gcc
-            qemu: qemu-riscv64
-            sysroot: /usr/riscv64-linux-gnu
+            runner: qemu-riscv64 -L /usr/riscv64-linux-gnu
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -197,31 +203,33 @@ jobs:
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "${{ matrix.target }}"
           rustup default "$RUST_TOOLCHAIN"
 
-      - name: Install cross toolchain and qemu
+      - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            ${{ matrix.gcc }} qemu-user
+          sudo apt-get install -y --no-install-recommends ${{ matrix.packages }}
 
-      # Both profiles, for the same reason the native matrix runs both:
-      # register allocation and spill choices differ at opt-level 3, and
-      # a switch bug that debug-mode stack traffic hides can surface
-      # only in release.
       # Note what is deliberately *not* set here: no
       # CARGO_TARGET_<TRIPLE>_RUSTFLAGS. That key replaces
       # `build.rustflags` rather than merging with it, so setting it
       # would silently drop `-Cforce-frame-pointers=yes` from
       # .cargo/config.toml — and `Fiber::saved_fp` then returns null,
       # failing the GC-introspection tests for a reason that has nothing
-      # to do with the switch. Learned the hard way while bringing these
-      # two ports up.
+      # to do with the switch. Learned the hard way bringing these up.
+      #
+      # Both profiles, for the same reason the native matrix runs both:
+      # register allocation differs at opt-level 3, and a switch bug that
+      # debug-mode stack traffic hides can surface only in release.
       - name: Run tests
         env:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
         run: |
           triple=$(echo "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
-          export "CARGO_TARGET_${triple}_LINKER=${{ matrix.linker }}"
-          export "CARGO_TARGET_${triple}_RUNNER=${{ matrix.qemu }} -L ${{ matrix.sysroot }}"
+          if [ -n "${{ matrix.linker }}" ]; then
+            export "CARGO_TARGET_${triple}_LINKER=${{ matrix.linker }}"
+          fi
+          if [ -n "${{ matrix.runner }}" ]; then
+            export "CARGO_TARGET_${triple}_RUNNER=${{ matrix.runner }}"
+          fi
           cargo test --workspace
           cargo test --workspace --release
 
