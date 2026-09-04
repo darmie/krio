@@ -52,7 +52,7 @@ tasks (per-fiber stack, but suspension Just Works).
 | `krio-core`      | ✅ shipped          |
 | `krio-runtime`   | ✅ shipped — RoundRobin scheduler |
 | `krio-stackless` | ✅ shipped — CooperativeExecutor + WakerExecutor |
-| `krio-fiber`     | ✅ shipped — Fiber on x86_64 (SysV + MS x64), aarch64 (non-Windows), x86-32 (SysV) and riscv64 (RV64GC); host-routed `yield_now` elsewhere |
+| `krio-fiber`     | ✅ shipped — Fiber on x86_64 (SysV + MS x64), aarch64 (incl. Windows + iOS), x86-32 (SysV) and riscv64 (RV64GC); host-routed `yield_now` elsewhere |
 | `krio-async`     | ✅ Phase 3 v2 — direct-yield + captures lift + cross-fn dispatch + multi-suspension blocks |
 | `krio-preempt`   | 🟨 v1 — TimeSliceScheduler (cooperative slicing); real signal preempt deferred |
 | `krio-parallel`  | 🟨 v1 — Cluster: bounded Chase–Lev deques, injector overflow, role-derived budgets, waker registry, stop-the-world safepoints. Needs a `Park` backend per target |
@@ -277,8 +277,17 @@ else in the family is portable Rust and builds anywhere.
 | aarch64 (Linux, macOS, **iOS**) | ✅ | native CI, both profiles |
 | **x86-32 SysV** (i686) | ✅ | qemu / 32-bit compat, both profiles |
 | **riscv64 (RV64GC)** | ✅ | qemu-riscv64, both profiles |
-| aarch64 Windows | ❌ panic stub | needs the TEB swap; see `arch.rs` |
+| **aarch64 Windows** | ✅ | native `windows-11-arm` CI, both profiles |
 | wasm32 | ❌ panic stub | no switchable stack exists |
+
+The only remaining stub is wasm32, where no switchable stack exists at
+all — see [`docs`](docs) and `krio_fiber::set_suspender` for what runs
+there instead.
+
+Windows fiber stacks have no guard page on either architecture:
+`stack.rs` falls back to a heap `Box<[u8]>` off unix, so an overflow
+corrupts the heap rather than trapping. That is a Windows-wide gap, not
+an architecture one, and wants `VirtualAlloc` + `PAGE_NOACCESS`.
 
 iOS needs nothing special: `aarch64-apple-ios` is `target_arch =
 "aarch64"`, so it takes the same AAPCS64 switch and
