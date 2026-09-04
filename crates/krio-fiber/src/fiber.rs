@@ -571,7 +571,7 @@ impl Fiber {
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    target_arch = "aarch64"
+    all(target_arch = "aarch64", not(windows))
 ))]
 pub fn yield_now() {
     let state_ptr = ACTIVE_TRAMPOLINE.with(|cell| cell.get());
@@ -739,7 +739,7 @@ pub fn should_yield_early() -> bool {
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    target_arch = "aarch64"
+    all(target_arch = "aarch64", not(windows))
 )))]
 static SUSPENDER: AtomicUsize = AtomicUsize::new(0);
 
@@ -783,7 +783,7 @@ static SUSPENDER: AtomicUsize = AtomicUsize::new(0);
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    target_arch = "aarch64"
+    all(target_arch = "aarch64", not(windows))
 )))]
 pub fn set_suspender(suspend: fn()) {
     SUSPENDER.store(suspend as usize, Ordering::Release);
@@ -797,7 +797,7 @@ pub fn set_suspender(suspend: fn()) {
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    target_arch = "aarch64"
+    all(target_arch = "aarch64", not(windows))
 )))]
 pub fn has_suspender() -> bool {
     SUSPENDER.load(Ordering::Acquire) != 0
@@ -817,7 +817,7 @@ pub fn has_suspender() -> bool {
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    target_arch = "aarch64"
+    all(target_arch = "aarch64", not(windows))
 )))]
 pub fn yield_now() {
     let installed = SUSPENDER.load(Ordering::Acquire);
@@ -925,14 +925,12 @@ unsafe fn prepare_initial_stack(stack: &mut [u8], state: *mut TrampolineState) -
         // Architecture-specific: place the trampoline as the
         // "return address" the saved frame pops on switch-in,
         // followed by zeroed callee-saved register slots.
-        // Both Windows targets seed the fiber's TEB stack bounds, so
-        // they take the three-argument form.
-        #[cfg(all(windows, any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "x86_64", windows))]
         {
             let stack_limit = stack.as_mut_ptr();
             prepare_initial_stack_arch(top, stack_limit, state)
         }
-        #[cfg(not(all(windows, any(target_arch = "x86_64", target_arch = "aarch64"))))]
+        #[cfg(not(all(target_arch = "x86_64", windows)))]
         prepare_initial_stack_arch(top, state)
     }
 }
@@ -1024,36 +1022,6 @@ unsafe fn prepare_initial_stack_arch(
         // ret_addr slot — trampoline entry point.
         (sp.add(SAVED_RET_OFFSET) as *mut usize)
             .write(fiber_trampoline_x86_64 as *const () as usize);
-    }
-    sp
-}
-
-#[cfg(all(target_arch = "aarch64", windows))]
-unsafe fn prepare_initial_stack_arch(
-    top: *mut u8,
-    stack_limit: *mut u8,
-    state: *mut TrampolineState,
-) -> *mut u8 {
-    // As the non-Windows twin below, plus the TEB stack bounds the
-    // switch swaps on every transition. They occupy padding the other
-    // target leaves empty, so the frame and every published offset are
-    // identical on both.
-    //
-    // Seeding these is what lets SEH unwind *out* of the fiber: until
-    // the first switch installs them, the runtime would see an `sp`
-    // outside the thread's registered stack and refuse to walk.
-    let sp = unsafe { top.sub(SAVED_FRAME_BYTES) };
-    unsafe {
-        core::ptr::write_bytes(sp, 0, SAVED_FRAME_BYTES);
-        // x19 carries the trampoline state.
-        (sp as *mut usize).write(state as usize);
-        // x30 is the address the first switch-in returns to.
-        (sp.add(SAVED_RET_OFFSET) as *mut usize)
-            .write(fiber_trampoline_aarch64 as *const () as usize);
-        // TEB.StackLimit — the low end of the fiber's usable stack.
-        (sp.add(168) as *mut usize).write(stack_limit as usize);
-        // TEB.StackBase — the high end, which is the aligned `top`.
-        (sp.add(176) as *mut usize).write(top as usize);
     }
     sp
 }
@@ -1155,7 +1123,7 @@ unsafe fn prepare_initial_stack_arch(top: *mut u8, state: *mut TrampolineState) 
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    target_arch = "aarch64"
+    all(target_arch = "aarch64", not(windows))
 )))]
 unsafe fn prepare_initial_stack_arch(_top: *mut u8, _state: *mut TrampolineState) -> *mut u8 {
     panic!("krio-fiber: native fibers are unavailable on this target");
@@ -1224,7 +1192,7 @@ unsafe extern "C" fn fiber_trampoline_riscv64() {
     core::arch::naked_asm!("mv a0, s1", "call {f}", "ebreak", f = sym fiber_run)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(windows)))]
 #[unsafe(naked)]
 unsafe extern "C" fn fiber_trampoline_aarch64() {
     // x19 holds the TrampolineState pointer. Move to x0 and call

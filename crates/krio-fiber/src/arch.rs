@@ -37,17 +37,44 @@
 //! [`super::stack`] has no guard-page allocator there either. Rather
 //! than compile into a switch that works until the first panic
 //! crosses a fiber boundary, ARM64 Windows takes the unsupported
-//! path and panics honestly. A real port is not large: ARM64 Windows
-//! keeps the TEB pointer in `x18` (which the AAPCS64 asm below
-//! correctly never touches, since Windows reserves it), so the TEB
-//! swap is a pair of `ldr`/`str` through `x18` instead of the
-//! `gs:`-relative moves used on x64.
+//! path and panics honestly.
+//!
+//! ### The TEB swap alone is not enough — measured
+//!
+//! An earlier revision of this comment said the port "is not large":
+//! ARM64 Windows keeps the TEB pointer in `x18` (which the AAPCS64 asm
+//! below correctly never touches, since Windows reserves it), so the
+//! stack-bounds swap is a pair of `ldr`/`str` through `x18` — StackBase
+//! at `[x18, #8]`, StackLimit at `[x18, #16]` — instead of the
+//! `gs:`-relative moves used on x64. That much is true, and it was
+//! written and run on a `windows-11-arm` runner.
+//!
+//! It is not sufficient. With the swap in place the whole suite passes
+//! in **debug** and dies in **release** with exit code `0xe06d7363` —
+//! the MS C++ EH code, raised on the first test that panics inside a
+//! fiber. Which is exactly the failure this stub exists to prevent, so
+//! the switch was reverted rather than shipped.
+//!
+//! What the evidence points at, for whoever picks this up: the asm
+//! blocks carry no SEH unwind data. On x64 a function without `.pdata`
+//! unwinds as a leaf with the return address at `[rsp]`, which happens
+//! to be survivable; ARM64 Windows makes no such accommodation, and a
+//! frame that adjusts `sp` by 192 without `.seh_` directives will
+//! mislead any walk that passes through it. The suspect is therefore
+//! `.seh_proc` / `.seh_endprologue` / `.seh_endproc` on both
+//! `krio_fiber_switch` and the trampoline, not the TEB pair. Note the
+//! phase-1 handler search may walk *past* `fiber_run`'s `catch_unwind`
+//! before deciding, which would explain why only the panicking tests
+//! fail while every other switch works.
+//!
+//! Debug passing is not evidence of correctness here; it is the same
+//! trap as before, one optimisation level lower.
 
 #[cfg(any(
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    target_arch = "aarch64"
+    all(target_arch = "aarch64", not(windows))
 ))]
 use core::arch::global_asm;
 
@@ -55,7 +82,7 @@ use core::arch::global_asm;
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    target_arch = "aarch64"
+    all(target_arch = "aarch64", not(windows))
 ))]
 unsafe extern "C" {
     /// Save the current context onto the current stack, then switch
@@ -398,72 +425,6 @@ global_asm!(
     "#
 );
 
-// AAPCS64 on Windows. Same register set as the block above — the AArch64
-// procedure call standard is the same — plus the TEB stack-bounds swap
-// the MS x64 path does, and for the same reason: SEH refuses to unwind
-// past an `sp` outside `[StackLimit, StackBase]`, so without it the
-// first panic crossing a fiber boundary kills the process with the MS
-// C++ EH exit code 0xe06d7363.
-//
-// ARM64 Windows reaches the TEB through `x18` rather than a segment
-// register. Windows reserves x18 for exactly this, which is why the
-// AAPCS64 block above is already correct in never touching it. The
-// NT_TIB layout matches x64: StackBase at +0x08, StackLimit at +0x10.
-//
-// The frame is still 192 bytes. The non-Windows layout ends with FPCR
-// at 160 and 24 bytes of alignment padding; the two TEB slots move into
-// that padding rather than growing the frame, so SAVED_FP_OFFSET and
-// SAVED_RET_OFFSET are unchanged and a GC walker sees the same shape on
-// both AArch64 targets:
-//   sp+160 : FPCR
-//   sp+168 : TEB.StackLimit save slot
-//   sp+176 : TEB.StackBase  save slot
-//   sp+184 : pad
-#[cfg(all(target_arch = "aarch64", windows))]
-global_asm!(
-    r#"
-    .global krio_fiber_switch
-    krio_fiber_switch:
-        sub  sp, sp, #192
-        stp  x19, x20, [sp, #0]
-        stp  x21, x22, [sp, #16]
-        stp  x23, x24, [sp, #32]
-        stp  x25, x26, [sp, #48]
-        stp  x27, x28, [sp, #64]
-        stp  x29, x30, [sp, #80]
-        stp  d8,  d9,  [sp, #96]
-        stp  d10, d11, [sp, #112]
-        stp  d12, d13, [sp, #128]
-        stp  d14, d15, [sp, #144]
-        mrs  x9, fpcr
-        str  x9, [sp, #160]
-        ldr  x9,  [x18, #16]
-        ldr  x10, [x18, #8]
-        stp  x9, x10, [sp, #168]
-        mov  x9, sp
-        str  x9, [x0]
-        ldr  x9, [x1]
-        mov  sp, x9
-        ldp  x19, x20, [sp, #0]
-        ldp  x21, x22, [sp, #16]
-        ldp  x23, x24, [sp, #32]
-        ldp  x25, x26, [sp, #48]
-        ldp  x27, x28, [sp, #64]
-        ldp  x29, x30, [sp, #80]
-        ldp  d8,  d9,  [sp, #96]
-        ldp  d10, d11, [sp, #112]
-        ldp  d12, d13, [sp, #128]
-        ldp  d14, d15, [sp, #144]
-        ldr  x9, [sp, #160]
-        msr  fpcr, x9
-        ldp  x9, x10, [sp, #168]
-        str  x9,  [x18, #16]
-        str  x10, [x18, #8]
-        add  sp, sp, #192
-        ret
-    "#
-);
-
 // Unsupported targets: stack-based context switching has no
 // implementation. Two groups land here:
 //
@@ -486,7 +447,7 @@ global_asm!(
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    target_arch = "aarch64"
+    all(target_arch = "aarch64", not(windows))
 )))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn krio_fiber_switch(_save_to: *mut *mut u8, _load_from: *const *mut u8) {
@@ -505,7 +466,7 @@ pub const SAVED_FRAME_BYTES: usize = 6 * 8 + 16; // rbp, rbx, r12..r15 + MXCSR/x
 #[cfg(all(target_arch = "x86_64", windows))]
 pub const SAVED_FRAME_BYTES: usize = 8 * 8 + 10 * 16 + 16 + 16; // GP + xmm + TEB + FP ctl = 256
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(windows)))]
 pub const SAVED_FRAME_BYTES: usize = 192; // 12 GP + 8 FP regs + FPCR + alignment pad
 
 #[cfg(all(target_arch = "x86", not(windows)))]
@@ -525,7 +486,7 @@ pub const SAVED_FP_OFFSET: usize = 56; // MXCSR/CW pad, r15,r14,r13,r12,rbx then
 #[cfg(all(target_arch = "x86_64", windows))]
 pub const SAVED_FP_OFFSET: usize = 232; // FP ctl, xmm6..xmm15, r15..r12, rsi, rdi, rbx, rbp
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(windows)))]
 pub const SAVED_FP_OFFSET: usize = 80; // x29 lives at sp+80 (see stp pair)
 
 #[cfg(all(target_arch = "x86", not(windows)))]
@@ -547,7 +508,7 @@ pub const SAVED_RET_OFFSET: usize = 64; // ret_addr sits above the full 64-byte 
 #[cfg(all(target_arch = "x86_64", windows))]
 pub const SAVED_RET_OFFSET: usize = 256; // ret_addr sits above the full 256-byte frame
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(windows)))]
 pub const SAVED_RET_OFFSET: usize = 88; // x30 lives at sp+88 (companion of x29)
 
 #[cfg(all(target_arch = "x86", not(windows)))]
@@ -564,20 +525,20 @@ pub const SAVED_RET_OFFSET: usize = 0;
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    target_arch = "aarch64"
+    all(target_arch = "aarch64", not(windows))
 )))]
 pub const SAVED_FRAME_BYTES: usize = 0;
 #[cfg(not(any(
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    target_arch = "aarch64"
+    all(target_arch = "aarch64", not(windows))
 )))]
 pub const SAVED_FP_OFFSET: usize = 0;
 #[cfg(not(any(
     target_arch = "x86_64",
     all(target_arch = "x86", not(windows)),
     target_arch = "riscv64",
-    target_arch = "aarch64"
+    all(target_arch = "aarch64", not(windows))
 )))]
 pub const SAVED_RET_OFFSET: usize = 0;

@@ -63,11 +63,6 @@ jobs:
           - name: Windows x86_64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
-          # The only place the ARM64 Windows TEB swap can be checked.
-          # Free with unlimited minutes on public repos since Aug 2025.
-          - name: Windows aarch64
-            runner: windows-11-arm
-            target: aarch64-pc-windows-msvc
 
     steps:
       - name: Checkout
@@ -103,14 +98,15 @@ jobs:
   #
   #   * wasm32 — no addressable switchable stack exists, permanently the
   #     panic-stub path;
-  #
-  # aarch64-pc-windows-msvc used to be gated here as a panic stub: an
-  # unqualified `cfg(target_arch = "aarch64")` once emitted the AAPCS64
-  # switch there with no TEB handling, producing a build that switched
-  # correctly and then died on the first panic crossing a fiber
-  # boundary. It now has the TEB swap and a native row in the matrix
-  # above, which tests the thing the stub was protecting against
-  # instead of merely compiling it.
+  #   * aarch64-pc-windows-msvc — an unqualified `cfg(target_arch =
+  #     "aarch64")` used to emit the AAPCS64 switch there with no TEB
+  #     handling, producing a build that switched correctly and then
+  #     died on the first panic crossing a fiber boundary. Adding the
+  #     TEB swap was tried on a windows-11-arm runner and is *still* not
+  #     enough — release dies with 0xe06d7363 on the panicking tests
+  #     while debug passes (see arch.rs). It remains an explicit panic
+  #     stub; this job keeps it from regressing into a switch that
+  #     merely compiles.
   cross-check:
     name: Cross-compile ${{ matrix.target }}
     runs-on: ubuntu-latest
@@ -118,6 +114,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
+          - aarch64-pc-windows-msvc
           - wasm32-unknown-unknown
           # atomics/bulk-memory on by default, so this is the row that
           # type-checks krio-wasm's shared-memory parking path. The
