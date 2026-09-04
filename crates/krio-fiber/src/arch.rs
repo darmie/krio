@@ -55,8 +55,17 @@
 //! fiber. Which is exactly the failure this stub exists to prevent, so
 //! the switch was reverted rather than shipped.
 //!
-//! Why debug passes and release does not is **not established**. One CI
-//! run is one data point, and the mechanism was never instrumented.
+//! The split is real, not an artefact of tests being skipped. The debug
+//! job ran `basic.rs` to "32 passed; 0 failed; 0 ignored; 0 filtered
+//! out", with `panicking_fiber_lands_in_errored_state` and
+//! `resuming_errored_fiber_panics` both `ok` — so debug genuinely
+//! unwinds a panic out of a fiber. Release dies at the first of those
+//! two, immediately after `no_yield_runs_to_done_in_one_resume`. Only
+//! `guard_page_traps_on_stack_overflow` is skipped, and it is
+//! `#[ignore]`d on non-unix by construction.
+//!
+//! Why the two differ is **not established**. One CI run is one data
+//! point, and the mechanism was never instrumented.
 //! Three candidates, with what argues for and against each:
 //!
 //! 1. **Inlining changes where the unwind walk ends up.** Debug keeps
@@ -75,7 +84,8 @@
 //!    to 64 KB; panic and unwinder machinery is stack-hungry, and an
 //!    overrun would corrupt the heap rather than trap. It explains why
 //!    only the panicking tests fail — but it argues the wrong way on
-//!    profile, since debug frames are larger and debug passed.
+//!    profile: debug frames are larger, and debug ran the identical
+//!    unwind path and survived it.
 //! 3. **Packed `.pdata`.** ARM64 Windows permits a compact unwind
 //!    encoding for simple prologues, which release code is likelier to
 //!    qualify for. Least likely; it would be a codegen bug.
