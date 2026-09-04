@@ -350,6 +350,10 @@ fn live_pointer_across_yield_is_findable_in_scan_window() {
 // all** and a fiber stack overflow there corrupts adjacent heap
 // instead of trapping. See the `#[ignore]`d twin below.
 
+// Only the unix probe reads it; on Windows the whole test is the
+// `#[ignore]`d twin below, and an ungated constant is a dead-code error
+// under the `-D warnings` the test job runs with.
+#[cfg(unix)]
 const GUARD_PROBE_ENV: &str = "KRIO_FIBER_GUARD_PAGE_PROBE_CHILD";
 
 #[cfg(unix)]

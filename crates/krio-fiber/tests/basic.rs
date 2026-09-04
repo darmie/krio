@@ -536,10 +536,27 @@ fn saved_fp_chain_terminates_cleanly() {
     });
     fiber.resume();
 
+    // Bound the walk to the fiber's own stack. A real walker must do
+    // this regardless — dereferencing a "frame pointer" that points
+    // outside the stack is exactly the bug this test exists to catch —
+    // and it is what makes the test meaningful on every target rather
+    // than only where the frame chain is a linked list.
+    //
+    // It is not one everywhere. `*fp == caller's fp` is a SysV/AAPCS
+    // convention; the Windows x64 ABI does not maintain a linked frame
+    // chain and unwinds through its own tables, so a walk there can
+    // leave the stack on the first hop even with frame pointers forced.
+    // Leaving is a clean stop, not a failure; following the pointer
+    // would be the failure.
+    let (stack_low, stack_len) = fiber.stack_range();
+    let stack_low = stack_low as usize;
+    let stack_high = stack_low + stack_len;
+    let in_stack = |p: usize| p >= stack_low && p < stack_high;
+
     let mut fp = fiber.saved_fp().expect("suspended fiber") as usize;
     let mut walked = 0;
     let max_frames = 64;
-    while fp != 0 && walked < max_frames {
+    while fp != 0 && walked < max_frames && in_stack(fp) {
         walked += 1;
         // Frame chain invariant: aligned word.
         assert_eq!(fp & 7, 0, "frame pointer must be 8-byte aligned");
@@ -549,12 +566,13 @@ fn saved_fp_chain_terminates_cleanly() {
         // top of the fiber's stack, or the chain continues with
         // a higher address (stack grows downward, so caller's fp
         // is higher than callee's).
-        if next_fp == 0 {
+        if next_fp == 0 || !in_stack(next_fp) {
             break;
         }
         // The next fp should be at a higher address (older frame).
-        // If it's lower, the chain is corrupt — likely we've walked
-        // off the end of the fiber's stack into garbage.
+        // If it's lower, the chain is corrupt — we are still inside
+        // the fiber's stack, so this is a genuinely broken chain
+        // rather than a foreign frame-pointer convention.
         assert!(
             next_fp > fp,
             "frame chain went backwards: next_fp={next_fp:#x} < fp={fp:#x} at step {walked}"
