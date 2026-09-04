@@ -1222,12 +1222,40 @@ unsafe extern "C" fn fiber_trampoline_riscv64() {
     core::arch::naked_asm!("mv a0, s1", "call {f}", "ebreak", f = sym fiber_run)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(windows)))]
 #[unsafe(naked)]
 unsafe extern "C" fn fiber_trampoline_aarch64() {
     // x19 holds the TrampolineState pointer. Move to x0 and call
     // `fiber_run`. ud2 / brk on return — fiber_run never returns.
     core::arch::naked_asm!("mov x0, x19", "bl {f}", "brk #0",
+        f = sym fiber_run,
+    )
+}
+
+#[cfg(all(target_arch = "aarch64", windows))]
+#[unsafe(naked)]
+unsafe extern "C" fn fiber_trampoline_aarch64() {
+    // As above, but the unwinder has to be able to stop here.
+    //
+    // This is the bottom frame of the fiber's stack: there is no caller
+    // to return to. SEH needs to be told that, and the two
+    // architectures spell it differently. On x64 the switch `ret`s by
+    // popping the stack, so a frame with no unwind data unwinds as a
+    // leaf reading its return address from `[rsp]` — which points into
+    // the synthetic frame `prepare_initial_stack_arch` zeroed, so the
+    // walk terminates on a null and everything works by accident.
+    //
+    // AArch64 `ret` jumps through x30 instead, and at entry x30 still
+    // holds *this function's own address* — the value the switch
+    // loaded to get here. A leaf unwind then reads x30, lands back at
+    // the same instruction, makes no progress, and the exception goes
+    // unhandled: 0xe06d7363.
+    //
+    // So null x30 before entering `fiber_run`, which means branching
+    // rather than `bl` — `bl` would immediately overwrite x30 with a
+    // live return address and put the loop straight back. `fiber_run`
+    // diverges, so there is no return path to give up.
+    core::arch::naked_asm!("mov x0, x19", "mov x30, xzr", "b {f}", "brk #0",
         f = sym fiber_run,
     )
 }
