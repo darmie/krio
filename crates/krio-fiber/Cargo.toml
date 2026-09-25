@@ -6,11 +6,17 @@ license.workspace = true
 repository.workspace = true
 description = "Stackful Wren/Lua-style fibers. Per-fiber stack allocation, target-specific context-switch primitive, first-class Fiber values."
 
+[features]
+# `Fiber`, its mmap stacks and the Task impl. Without it only the
+# allocation-free `raw` layer builds, for no_std hosts.
+default = ["std"]
+std = ["dep:libc"]
+
 [dependencies]
 krio-core = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 
 [lints]
 workspace = true

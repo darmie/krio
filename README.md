@@ -52,7 +52,7 @@ tasks (per-fiber stack, but suspension Just Works).
 | `krio-core`      | ✅ shipped          |
 | `krio-runtime`   | ✅ shipped — RoundRobin scheduler |
 | `krio-stackless` | ✅ shipped — CooperativeExecutor + WakerExecutor |
-| `krio-fiber`     | ✅ shipped — Fiber on x86_64 (SysV + MS x64), aarch64 (non-Windows, incl. iOS), x86-32 (SysV) and riscv64 (RV64GC); host-routed `yield_now` elsewhere |
+| `krio-fiber`     | ✅ shipped — Fiber on x86_64 (SysV + MS x64), aarch64 (non-Windows, incl. iOS), x86-32 (SysV) and riscv64 (RV64GC); host-routed `yield_now` elsewhere; allocation-free `raw` contexts (no_std) with direct peer-to-peer switching |
 | `krio-async`     | ✅ Phase 3 v2 — direct-yield + captures lift + cross-fn dispatch + multi-suspension blocks |
 | `krio-preempt`   | 🟨 v1 — TimeSliceScheduler (cooperative slicing); real signal preempt deferred |
 | `krio-parallel`  | 🟨 v1 — Cluster: bounded Chase–Lev deques, injector overflow, role-derived budgets, waker registry, stop-the-world safepoints. Needs a `Park` backend per target |

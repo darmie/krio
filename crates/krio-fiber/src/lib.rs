@@ -57,13 +57,22 @@
 //!
 //! ## Not yet implemented
 //!
-//! - Symmetric `transfer` semantics (abandon the current fiber's
+//! - Symmetric `transfer` on [`Fiber`] (abandon the current fiber's
 //!   continuation, switch to a peer with the original caller). The
-//!   nested-call form covers most use cases.
+//!   nested-call form covers most use cases, and [`raw::switch`]
+//!   transfers between any two contexts.
 //! - Targets beyond x86_64 + aarch64-non-Windows. ARM64 Windows is
 //!   the closest: it reaches the TEB through `x18` (which the AAPCS64
 //!   switch never touches, since Windows reserves it) rather than the
 //!   `gs:`-relative moves x64 uses.
+//!
+//! ## Without `std`
+//!
+//! The [`raw`] module needs neither `std` nor a heap: the host provides
+//! each stack, [`raw::Context::new`] lays out its first frame, and
+//! [`raw::switch`] moves between any two contexts. Build with
+//! `default-features = false` to get only that layer, for kernels and
+//! bare-metal targets.
 //!
 //! ## Where this fits in the krio family
 //!
@@ -73,10 +82,25 @@
 //! can mix stackless coroutines and stackful fibers freely; they
 //! cost what their model says they cost.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+// Some layout constants only serve `Fiber`.
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
 mod arch;
+#[cfg(feature = "std")]
 mod fiber;
+mod frame;
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", not(windows)),
+    target_arch = "riscv64",
+    target_arch = "aarch64"
+))]
+pub mod raw;
+#[cfg(feature = "std")]
 mod stack;
 
+#[cfg(feature = "std")]
 pub use fiber::{
     DEFAULT_STACK_SIZE, Fiber, FiberState, FiberStep, current_fiber_id, is_cancelled,
     is_deadline_passed, now_ms, set_clock, should_yield_early, take_input, take_input_u64,
@@ -87,10 +111,13 @@ pub use fiber::{
 // docs on `set_suspender`. Re-exported separately so the symbol simply
 // does not appear on a target that switches its own stack, rather than
 // appearing and panicking.
-#[cfg(not(any(
-    target_arch = "x86_64",
-    all(target_arch = "x86", not(windows)),
-    target_arch = "riscv64",
-    target_arch = "aarch64"
-)))]
+#[cfg(all(
+    feature = "std",
+    not(any(
+        target_arch = "x86_64",
+        all(target_arch = "x86", not(windows)),
+        target_arch = "riscv64",
+        target_arch = "aarch64"
+    ))
+))]
 pub use fiber::{has_suspender, set_suspender};
