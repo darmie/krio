@@ -16,7 +16,11 @@
 
 /// One fiber's stack. The `usable` slice is what the fiber actually
 /// runs on. On Unix we also own a separate guard page below it.
-pub(crate) struct Stack {
+///
+/// Public for [`raw`](crate::raw) users that manage their own contexts:
+/// pass [`Stack::usable_slice_mut`] to [`raw::Context::new`](crate::raw::Context::new)
+/// and keep the `Stack` alive as long as the context can run.
+pub struct Stack {
     #[cfg(unix)]
     base: *mut libc::c_void,
     #[cfg(unix)]
@@ -35,7 +39,7 @@ impl Stack {
     /// Allocate a new fiber stack with at least `requested_size`
     /// usable bytes. Sizes are rounded up to a page boundary on
     /// unix, or to 16 bytes on other targets.
-    pub(crate) fn new(requested_size: usize) -> Self {
+    pub fn new(requested_size: usize) -> Self {
         #[cfg(unix)]
         {
             unsafe { mmap_stack(requested_size) }
@@ -53,13 +57,13 @@ impl Stack {
     }
 
     /// Length of the usable region in bytes.
-    pub(crate) fn usable_len(&self) -> usize {
+    pub fn usable_len(&self) -> usize {
         self.usable_len
     }
 
     /// Slice of the usable region. Shared mutable view — caller
     /// must respect aliasing rules.
-    pub(crate) fn usable_slice_mut(&mut self) -> &mut [u8] {
+    pub fn usable_slice_mut(&mut self) -> &mut [u8] {
         // SAFETY: `usable_start` and `usable_len` describe a region
         // we own (mmap or Box) for `Stack`'s lifetime.
         unsafe { std::slice::from_raw_parts_mut(self.usable_start, self.usable_len) }

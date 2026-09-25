@@ -99,6 +99,8 @@ mod frame;
 pub mod raw;
 #[cfg(feature = "std")]
 mod stack;
+#[cfg(feature = "std")]
+pub use stack::Stack;
 
 #[cfg(feature = "std")]
 pub use fiber::{
