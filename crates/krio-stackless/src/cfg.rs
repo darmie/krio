@@ -164,4 +164,17 @@ pub trait CoroHooks {
         idx: usize,
         resume_bb: <Self::Cfg as CoroCfg>::BlockId,
     ) -> <Self::Cfg as CoroCfg>::LocalId;
+
+    /// The priority of the coroutine whose `CoroutineBegin` marker is at
+    /// `(bb, idx)`: lower runs first. `None` (the default) when it has
+    /// none. When any coroutine of a region has one, the cooperative
+    /// executor runs the region by strict priority.
+    fn coroutine_priority(
+        &self,
+        _cfg: &Self::Cfg,
+        _bb: <Self::Cfg as CoroCfg>::BlockId,
+        _idx: usize,
+    ) -> Option<u32> {
+        None
+    }
 }

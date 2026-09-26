@@ -122,6 +122,14 @@ pub use executor::{CooperativeExecutor, Executor, RegionExits, WakerExecutor};
 
 const DONE_STATE: i64 = 9999;
 
+/// A machine's poll result: it completed.
+const POLL_READY: i64 = 0;
+/// It ran and suspended.
+const POLL_PENDING: i64 = 1;
+/// It found its guarded operation not ready and suspended without
+/// running anything.
+const POLL_BLOCKED: i64 = 2;
+
 /// Coordinates the algorithm has discovered for a region or coroutine.
 /// Used internally; surfaced for advanced consumers who want to drive
 /// their own executor.
@@ -136,6 +144,8 @@ pub struct Region<B: CfgId> {
 pub struct Coroutine<B: CfgId> {
     pub begin: (B, usize),
     pub end: (B, usize),
+    /// From [`CoroHooks::coroutine_priority`]: lower runs first.
+    pub priority: Option<u32>,
 }
 
 /// Per-coroutine state machine — the locals + dispatch/exit blocks
@@ -195,6 +205,7 @@ where
     let mut current_region: Option<(C::BlockId, usize)> = None;
     let mut current_coroutines: Vec<Coroutine<C::BlockId>> = Vec::new();
     let mut current_coro_begin: Option<(C::BlockId, usize)> = None;
+    let mut current_priority: Option<u32> = None;
 
     for bb in cfg.block_ids() {
         for stmt_idx in 0..cfg.statement_count(bb) {
@@ -214,12 +225,14 @@ where
                 }
                 Some(Marker::CoroutineBegin) => {
                     current_coro_begin = Some((bb, stmt_idx));
+                    current_priority = hooks.coroutine_priority(cfg, bb, stmt_idx);
                 }
                 Some(Marker::CoroutineEnd) => {
                     if let Some(begin) = current_coro_begin.take() {
                         current_coroutines.push(Coroutine {
                             begin,
                             end: (bb, stmt_idx),
+                            priority: current_priority.take(),
                         });
                     }
                 }
@@ -382,7 +395,7 @@ fn emit_no_suspension_machine<C: CoroCfg>(
 
     // Done block: poll = Ready, state = DONE, goto exit.
     let done_bb = cfg.new_block();
-    cfg.emit_assign_i64(done_bb, poll_result_local, 0);
+    cfg.emit_assign_i64(done_bb, poll_result_local, POLL_READY);
     cfg.emit_assign_i64(done_bb, state_local, DONE_STATE);
     cfg.set_goto(done_bb, exit_bb);
 
@@ -424,7 +437,7 @@ fn emit_multi_state_machine<C, H>(
         // Yield block: state = next_id; poll = Pending; goto exit.
         let yield_bb = cfg.new_block();
         cfg.emit_assign_i64(yield_bb, state_local, state_id);
-        cfg.emit_assign_i64(yield_bb, poll_result_local, 1);
+        cfg.emit_assign_i64(yield_bb, poll_result_local, POLL_PENDING);
         cfg.set_goto(yield_bb, exit_bb);
 
         // Resume block: split out the tail of the suspend's block.
@@ -434,9 +447,14 @@ fn emit_multi_state_machine<C, H>(
             SuspKind::GuardedRecv => {
                 // Hook does the IR-specific surgery: emit the peek,
                 // move the original recv into resume_bb, return the
-                // bool LocalId of the peek result.
+                // bool LocalId of the peek result. A failed peek
+                // suspends as blocked: nothing ran.
                 let is_ready = hooks.emit_guarded_recv_peek(cfg, susp_bb, susp_stmt, resume_bb);
-                cfg.set_branch(susp_bb, is_ready, resume_bb, yield_bb);
+                let blocked_bb = cfg.new_block();
+                cfg.emit_assign_i64(blocked_bb, state_local, state_id);
+                cfg.emit_assign_i64(blocked_bb, poll_result_local, POLL_BLOCKED);
+                cfg.set_goto(blocked_bb, exit_bb);
+                cfg.set_branch(susp_bb, is_ready, resume_bb, blocked_bb);
             }
             SuspKind::ProducingSend => {
                 // Producing send: keep the send statement, redirect
@@ -456,7 +474,7 @@ fn emit_multi_state_machine<C, H>(
 
     // Done block: poll = Ready, state = DONE, goto exit.
     let done_bb = cfg.new_block();
-    cfg.emit_assign_i64(done_bb, poll_result_local, 0);
+    cfg.emit_assign_i64(done_bb, poll_result_local, POLL_READY);
     cfg.emit_assign_i64(done_bb, state_local, DONE_STATE);
     cfg.set_goto(done_bb, exit_bb);
 

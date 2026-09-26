@@ -21,7 +21,7 @@
 //! trait.
 
 use crate::cfg::CoroCfg;
-use crate::{DONE_STATE, Machine, Region};
+use crate::{DONE_STATE, Machine, POLL_BLOCKED, Region};
 use krio_core::CfgId;
 
 /// Build the executor wrapper around already-emitted coroutine state
@@ -51,7 +51,11 @@ impl<C: CoroCfg> Executor<C> for CooperativeExecutor {
         region: &Region<C::BlockId>,
         machines: &[Machine<C::BlockId, C::LocalId>],
     ) {
-        build_cooperative_loop(cfg, region, machines);
+        if region.coroutines.iter().any(|c| c.priority.is_some()) {
+            build_priority_loop(cfg, region, machines);
+        } else {
+            build_cooperative_loop(cfg, region, machines);
+        }
     }
 }
 
@@ -76,27 +80,7 @@ fn build_cooperative_loop<C: CoroCfg>(
     machines: &[Machine<C::BlockId, C::LocalId>],
 ) {
     let loop_bb = cfg.new_block();
-    let region_exit_bb = cfg.new_block();
-
-    // The exit block inherits whatever the original `region_end`
-    // block was pointing to — that's the "after the region" path
-    // in source order. We grab it by setting the new block's
-    // terminator to `goto region_end` first, then redirecting.
-    // Simpler: split the region_end block at its end, take the new
-    // block as the exit.
-    //
-    // Easiest path that matches the original implementation: set the
-    // exit block to fall through to whatever region_end's successor
-    // was. We don't have a "clone terminator" trait method, so we
-    // use redirect_targets to redirect from a sentinel — but we
-    // don't have a clean way to express that either.
-    //
-    // Workaround: use split_after on region_end at its last index to
-    // force the post-region terminator into a new block we'll keep.
-    let region_end_bb = region.region_end.0;
-    let last_idx = cfg.statement_count(region_end_bb).saturating_sub(1);
-    let post_region_bb = cfg.split_after(region_end_bb, last_idx);
-    cfg.set_goto(region_exit_bb, post_region_bb);
+    let region_exit_bb = region_exit(cfg, region);
 
     let all_done_local = cfg.new_mut_bool_local();
 
@@ -152,6 +136,30 @@ fn build_cooperative_loop<C: CoroCfg>(
     // still true, otherwise round-robin again.
     cfg.set_branch(current_bb, all_done_local, region_exit_bb, loop_bb);
 
+    finish_region(cfg, region, machines, loop_bb);
+}
+
+/// The block control reaches once every coroutine of `region` is done:
+/// it continues with whatever followed the region.
+fn region_exit<C: CoroCfg>(cfg: &mut C, region: &Region<C::BlockId>) -> C::BlockId {
+    let region_exit_bb = cfg.new_block();
+    // Split region_end after its last statement so the post-region
+    // terminator lands in a block of its own, then continue there.
+    let region_end_bb = region.region_end.0;
+    let last_idx = cfg.statement_count(region_end_bb).saturating_sub(1);
+    let post_region_bb = cfg.split_after(region_end_bb, last_idx);
+    cfg.set_goto(region_exit_bb, post_region_bb);
+    region_exit_bb
+}
+
+/// Erase the region's markers, initialise every machine's state, and
+/// enter the executor at `entry_bb`.
+fn finish_region<C: CoroCfg>(
+    cfg: &mut C,
+    region: &Region<C::BlockId>,
+    machines: &[Machine<C::BlockId, C::LocalId>],
+    entry_bb: C::BlockId,
+) {
     // Erase the per-coroutine markers — the dispatch + executor
     // logic owns the control flow now.
     for coroutine in &region.coroutines {
@@ -202,7 +210,135 @@ fn build_cooperative_loop<C: CoroCfg>(
     for machine in machines {
         cfg.emit_assign_i64(region_begin_bb, machine.state_local, 0);
     }
-    cfg.set_goto(region_begin_bb, loop_bb);
+    cfg.set_goto(region_begin_bb, entry_bb);
+}
+
+/// Lay out a strict-priority loop, for regions whose coroutines have
+/// priorities. Lower priorities run first; coroutines without one come
+/// after all that have one. The lowest ready band always runs next:
+/// after any coroutine runs (or completes) the scan restarts from the
+/// top, and one that is blocked passes the turn along. Within a band
+/// the scan resumes after the member that ran last, so equal
+/// priorities take turns.
+///
+/// ```text
+/// top:
+///   for each band B (lowest first), members m_0..m_n-1, last_B:
+///     for k in last_B+1..n, then 0..=last_B:
+///       if state_k != DONE { poll m_k
+///         blocked      -> continue the scan
+///         ran / done   -> last_B = k; goto top }
+///   all done ? exit : goto top
+/// ```
+fn build_priority_loop<C: CoroCfg>(
+    cfg: &mut C,
+    region: &Region<C::BlockId>,
+    machines: &[Machine<C::BlockId, C::LocalId>],
+) {
+    let region_exit_bb = region_exit(cfg, region);
+
+    let mut order: Vec<usize> = (0..machines.len()).collect();
+    order.sort_by_key(|&i| (region.coroutines[i].priority.unwrap_or(u32::MAX), i));
+    let mut bands: Vec<Vec<usize>> = Vec::new();
+    for i in order {
+        let p = region.coroutines[i].priority;
+        match bands.last_mut() {
+            Some(band) if region.coroutines[band[0]].priority == p => band.push(i),
+            _ => bands.push(vec![i]),
+        }
+    }
+
+    let init_bb = cfg.new_block();
+    let top_bb = cfg.new_block();
+    let check_done_bb = cfg.new_block();
+    // Per band: the member that ran last (-1: none yet) and which half
+    // of the scan is under way.
+    let lasts: Vec<C::LocalId> = bands.iter().map(|_| cfg.new_state_local()).collect();
+    let sweeps: Vec<C::LocalId> = bands.iter().map(|_| cfg.new_state_local()).collect();
+    for &last in &lasts {
+        cfg.emit_assign_i64(init_bb, last, -1);
+    }
+    cfg.set_goto(init_bb, top_bb);
+
+    // Scan sites: first half (members after last), second half (the
+    // rest), for each band in order.
+    let firsts: Vec<Vec<C::BlockId>> = bands
+        .iter()
+        .map(|b| b.iter().map(|_| cfg.new_block()).collect())
+        .collect();
+    let seconds: Vec<Vec<C::BlockId>> = bands
+        .iter()
+        .map(|b| b.iter().map(|_| cfg.new_block()).collect())
+        .collect();
+    cfg.set_goto(top_bb, firsts[0][0]);
+
+    for (b, band) in bands.iter().enumerate() {
+        let n = band.len();
+        let next_band = firsts.get(b + 1).map_or(check_done_bb, |f| f[0]);
+        for (k, &m) in band.iter().enumerate() {
+            let machine = &machines[m];
+            let next_first = if k + 1 < n {
+                firsts[b][k + 1]
+            } else {
+                seconds[b][0]
+            };
+            let next_second = if k + 1 < n {
+                seconds[b][k + 1]
+            } else {
+                next_band
+            };
+            let later: Vec<i64> = (k as i64..n as i64).collect();
+
+            // First half polls k when last < k; second half when last >= k.
+            let poll_first = cfg.new_block();
+            let poll_second = cfg.new_block();
+            cfg.set_switch(
+                firsts[b][k],
+                lasts[b],
+                later.iter().map(|&v| (v, next_first)).collect(),
+                poll_first,
+            );
+            cfg.set_switch(
+                seconds[b][k],
+                lasts[b],
+                later.iter().map(|&v| (v, poll_second)).collect(),
+                next_second,
+            );
+            for (poll, sweep, next) in [(poll_first, 0, next_first), (poll_second, 1, next_second)]
+            {
+                cfg.emit_assign_i64(poll, sweeps[b], sweep);
+                let done = cfg.new_bool_local();
+                cfg.emit_eq_check_i64(poll, done, machine.state_local, DONE_STATE);
+                cfg.set_branch(poll, done, next, machine.dispatch_bb);
+            }
+
+            // After the poll: blocked passes the turn on; anything else
+            // restarts from the top band.
+            let after = cfg.new_block();
+            cfg.set_goto(machine.exit_bb, after);
+            let blocked = cfg.new_bool_local();
+            cfg.emit_eq_check_i64(after, blocked, machine.poll_result_local, POLL_BLOCKED);
+            let ran = cfg.new_block();
+            let pass_on = cfg.new_block();
+            cfg.set_branch(after, blocked, pass_on, ran);
+            cfg.emit_assign_i64(ran, lasts[b], k as i64);
+            cfg.set_goto(ran, top_bb);
+            cfg.set_switch(pass_on, sweeps[b], vec![(0, next_first)], next_second);
+        }
+    }
+
+    // Nothing ran this scan: leave once all are done, else scan again.
+    let mut check_bb = check_done_bb;
+    for machine in machines {
+        let done = cfg.new_bool_local();
+        cfg.emit_eq_check_i64(check_bb, done, machine.state_local, DONE_STATE);
+        let next = cfg.new_block();
+        cfg.set_branch(check_bb, done, next, top_bb);
+        check_bb = next;
+    }
+    cfg.set_goto(check_bb, region_exit_bb);
+
+    finish_region(cfg, region, machines, init_bb);
 }
 
 // ── WakerExecutor ─────────────────────────────────────────────────
