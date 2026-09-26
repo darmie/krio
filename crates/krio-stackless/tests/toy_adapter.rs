@@ -201,6 +201,21 @@ impl CoroCfg for ToyBody {
         };
     }
 
+    fn successors(&self, bb: ToyBlockId) -> Vec<ToyBlockId> {
+        match &self.blocks[bb.0 as usize].1 {
+            ToyTerm::Unreachable | ToyTerm::Return => vec![],
+            ToyTerm::Goto(t) => vec![*t],
+            ToyTerm::Branch { t, f, .. } => vec![*t, *f],
+            ToyTerm::Switch {
+                targets, otherwise, ..
+            } => targets
+                .iter()
+                .map(|(_, b)| *b)
+                .chain(std::iter::once(*otherwise))
+                .collect(),
+        }
+    }
+
     fn redirect_targets(&mut self, bb: ToyBlockId, from: ToyBlockId, to: ToyBlockId) {
         let term = &mut self.blocks[bb.0 as usize].1;
         match term {

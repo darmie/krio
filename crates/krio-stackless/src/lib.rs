@@ -234,7 +234,10 @@ where
 // ── Suspension point detection ─────────────────────────────────────
 //
 // Suspension points are statements that may give up control: yield,
-// guarded recv, producing send. The list is in CFG order so state
+// guarded recv, producing send. A coroutine's body is every block
+// reachable from its begin marker without passing its end marker —
+// not a range of block ids, since a consumer may number a loop's exit
+// block before the rest of its body. The list is in CFG order so state
 // IDs can be assigned 1..=K.
 
 pub fn find_suspension_points<C, H>(
@@ -246,19 +249,33 @@ where
     C: CoroCfg,
     H: CoroHooks<Cfg = C>,
 {
-    let mut points = Vec::new();
-    let begin = coroutine.begin.0;
-    let end = coroutine.end.0;
-    for bb in cfg.block_ids() {
-        // Skip blocks before the coroutine's begin block.
-        if bb < begin {
+    let (begin, begin_idx) = coroutine.begin;
+    let (end, end_idx) = coroutine.end;
+
+    let mut body = vec![begin];
+    let mut stack = vec![begin];
+    while let Some(bb) = stack.pop() {
+        if bb == end {
             continue;
         }
-        // Stop once we're past the coroutine's end block.
-        if bb > end {
-            break;
+        for succ in cfg.successors(bb) {
+            if !body.contains(&succ) {
+                body.push(succ);
+                stack.push(succ);
+            }
         }
-        for idx in 0..cfg.statement_count(bb) {
+    }
+    body.sort();
+
+    let mut points = Vec::new();
+    for bb in body {
+        let first = if bb == begin { begin_idx + 1 } else { 0 };
+        let last = if bb == end {
+            end_idx
+        } else {
+            cfg.statement_count(bb)
+        };
+        for idx in first..last {
             match hooks.classify_marker(cfg, bb, idx) {
                 Some(Marker::Yield) => points.push((bb, idx, SuspKind::Yield)),
                 Some(Marker::GuardedRecv) => points.push((bb, idx, SuspKind::GuardedRecv)),

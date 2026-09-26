@@ -118,6 +118,10 @@ impl CoroCfg for ToyCfg {
     ) {
         unimplemented!()
     }
+    fn successors(&self, _: ToyBlockId) -> Vec<ToyBlockId> {
+        unimplemented!()
+    }
+
     fn redirect_targets(&mut self, _: ToyBlockId, _: ToyBlockId, _: ToyBlockId) {
         unimplemented!()
     }

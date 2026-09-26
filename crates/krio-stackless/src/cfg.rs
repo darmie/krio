@@ -42,6 +42,9 @@ pub trait CoroCfg {
     /// Iterate the (in-order) block IDs. Used during region discovery.
     fn block_ids(&self) -> Vec<Self::BlockId>;
 
+    /// The blocks `bb`'s terminator can transfer control to.
+    fn successors(&self, bb: Self::BlockId) -> Vec<Self::BlockId>;
+
     // ── Construction ───────────────────────────────────────────────
 
     /// Allocate a fresh empty block. The default terminator is the
