@@ -83,9 +83,12 @@ fn build_cooperative_loop<C: CoroCfg>(
     let region_exit_bb = region_exit(cfg, region);
 
     let all_done_local = cfg.new_mut_bool_local();
+    // Whether any poll this pass finished, yielded or passed a guard.
+    let progress = machines[0].progress_local;
 
-    // Top of the loop: clear all_done.
+    // Top of the loop: clear all_done and progress.
     cfg.emit_assign_bool(loop_bb, all_done_local, true);
+    cfg.emit_assign_i64(loop_bb, progress, 0);
 
     // Chain per coroutine:
     //   loop_bb -> check_0 -> [done? skip : dispatch_0 -> exit_0]
@@ -126,15 +129,36 @@ fn build_cooperative_loop<C: CoroCfg>(
         cfg.emit_assign_i64(mark_done_bb, machine.state_local, DONE_STATE);
         cfg.set_goto(mark_done_bb, next_bb);
 
+        cfg.emit_assign_i64(mark_done_bb, progress, 1);
         cfg.emit_assign_bool(mark_pending_bb, all_done_local, false);
-        cfg.set_goto(mark_pending_bb, next_bb);
+        // A yield ran; a shut guard did not (though a guard passed
+        // earlier in the poll set progress itself).
+        let blocked = cfg.new_bool_local();
+        cfg.emit_eq_check_i64(
+            mark_pending_bb,
+            blocked,
+            machine.poll_result_local,
+            POLL_BLOCKED,
+        );
+        let ran_bb = cfg.new_block();
+        cfg.set_branch(mark_pending_bb, blocked, next_bb, ran_bb);
+        cfg.emit_assign_i64(ran_bb, progress, 1);
+        cfg.set_goto(ran_bb, next_bb);
 
         current_bb = next_bb;
     }
 
-    // After all coroutines have been polled: exit if all_done is
-    // still true, otherwise round-robin again.
-    cfg.set_branch(current_bb, all_done_local, region_exit_bb, loop_bb);
+    // After all coroutines have been polled: exit if all are done, go
+    // round again if any ran, and otherwise none ever will.
+    let not_done_bb = cfg.new_block();
+    cfg.set_branch(current_bb, all_done_local, region_exit_bb, not_done_bb);
+    let stuck_bb = cfg.new_block();
+    let progressed = cfg.new_bool_local();
+    cfg.emit_eq_check_i64(not_done_bb, progressed, progress, 1);
+    cfg.set_branch(not_done_bb, progressed, loop_bb, stuck_bb);
+    if !cfg.emit_deadlock(stuck_bb) {
+        cfg.set_goto(stuck_bb, loop_bb);
+    }
 
     finish_region(cfg, region, machines, loop_bb);
 }
@@ -259,6 +283,10 @@ fn build_priority_loop<C: CoroCfg>(
         cfg.emit_assign_i64(init_bb, last, -1);
     }
     cfg.set_goto(init_bb, top_bb);
+    // Whether a scan passed a guard: a coroutine that then blocked still
+    // ran.
+    let progress = machines[0].progress_local;
+    cfg.emit_assign_i64(top_bb, progress, 0);
 
     // Scan sites: first half (members after last), second half (the
     // rest), for each band in order.
@@ -327,13 +355,22 @@ fn build_priority_loop<C: CoroCfg>(
         }
     }
 
-    // Nothing ran this scan: leave once all are done, else scan again.
+    // Every poll this scan blocked: leave once all are done, scan again
+    // if one passed a guard first, and otherwise none ever will run.
+    let stuck_bb = cfg.new_block();
+    let no_progress_bb = cfg.new_block();
+    let progressed = cfg.new_bool_local();
+    cfg.emit_eq_check_i64(no_progress_bb, progressed, progress, 1);
+    cfg.set_branch(no_progress_bb, progressed, top_bb, stuck_bb);
+    if !cfg.emit_deadlock(stuck_bb) {
+        cfg.set_goto(stuck_bb, top_bb);
+    }
     let mut check_bb = check_done_bb;
     for machine in machines {
         let done = cfg.new_bool_local();
         cfg.emit_eq_check_i64(check_bb, done, machine.state_local, DONE_STATE);
         let next = cfg.new_block();
-        cfg.set_branch(check_bb, done, next, top_bb);
+        cfg.set_branch(check_bb, done, next, no_progress_bb);
         check_bb = next;
     }
     cfg.set_goto(check_bb, region_exit_bb);

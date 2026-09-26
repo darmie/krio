@@ -154,6 +154,10 @@ pub struct Coroutine<B: CfgId> {
 pub struct Machine<B: CfgId, L: CfgId> {
     pub state_local: L,
     pub poll_result_local: L,
+    /// Shared by the region's machines: set to 1 when a guard passes,
+    /// so an executor can tell a coroutine that ran and then blocked from
+    /// one that did nothing.
+    pub progress_local: L,
     pub dispatch_bb: B,
     pub exit_bb: B,
 }
@@ -321,10 +325,11 @@ fn transform_region<C, H, E>(
         .collect();
 
     let mut machines: Vec<Machine<C::BlockId, C::LocalId>> = Vec::new();
+    let progress_local = cfg.new_state_local();
 
     for (idx, coroutine) in region.coroutines.iter().enumerate() {
         let suspensions = &coro_suspensions[idx];
-        let machine = build_state_machine(cfg, hooks, coroutine, suspensions);
+        let machine = build_state_machine(cfg, hooks, coroutine, suspensions, progress_local);
         machines.push(machine);
     }
 
@@ -337,6 +342,7 @@ fn build_state_machine<C, H>(
     hooks: &mut H,
     coroutine: &Coroutine<C::BlockId>,
     suspensions: &[(C::BlockId, usize, SuspKind)],
+    progress_local: C::LocalId,
 ) -> Machine<C::BlockId, C::LocalId>
 where
     C: CoroCfg,
@@ -366,6 +372,7 @@ where
             suspensions,
             state_local,
             poll_result_local,
+            progress_local,
             dispatch_bb,
             exit_bb,
         );
@@ -374,6 +381,7 @@ where
     Machine {
         state_local,
         poll_result_local,
+        progress_local,
         dispatch_bb,
         exit_bb,
     }
@@ -419,6 +427,7 @@ fn emit_multi_state_machine<C, H>(
     suspensions: &[(C::BlockId, usize, SuspKind)],
     state_local: C::LocalId,
     poll_result_local: C::LocalId,
+    progress_local: C::LocalId,
     dispatch_bb: C::BlockId,
     exit_bb: C::BlockId,
 ) where
@@ -440,22 +449,37 @@ fn emit_multi_state_machine<C, H>(
         cfg.emit_assign_i64(yield_bb, poll_result_local, POLL_PENDING);
         cfg.set_goto(yield_bb, exit_bb);
 
+        if susp_kind == SuspKind::GuardedRecv {
+            // The guard gets a block of its own, where a blocked
+            // coroutine resumes to look again: the peek, then the
+            // guarded operation at the head of resume_bb.
+            let guard_bb = if susp_stmt == 0 {
+                susp_bb
+            } else {
+                let guard_bb = cfg.split_after(susp_bb, susp_stmt - 1);
+                cfg.set_goto(susp_bb, guard_bb);
+                guard_bb
+            };
+            let resume_bb = cfg.split_after(guard_bb, 0);
+            // Hook does the IR-specific surgery: emit the peek, move the
+            // original operation into resume_bb, return the bool LocalId
+            // of the peek result. A failed peek suspends as blocked.
+            let is_ready = hooks.emit_guarded_recv_peek(cfg, guard_bb, 0, resume_bb);
+            cfg.prepend_assign_i64(resume_bb, progress_local, 1);
+            let blocked_bb = cfg.new_block();
+            cfg.emit_assign_i64(blocked_bb, state_local, state_id);
+            cfg.emit_assign_i64(blocked_bb, poll_result_local, POLL_BLOCKED);
+            cfg.set_goto(blocked_bb, exit_bb);
+            cfg.set_branch(guard_bb, is_ready, resume_bb, blocked_bb);
+            state_entries.push(guard_bb);
+            continue;
+        }
+
         // Resume block: split out the tail of the suspend's block.
         let resume_bb = cfg.split_after(susp_bb, susp_stmt);
 
         match susp_kind {
-            SuspKind::GuardedRecv => {
-                // Hook does the IR-specific surgery: emit the peek,
-                // move the original recv into resume_bb, return the
-                // bool LocalId of the peek result. A failed peek
-                // suspends as blocked: nothing ran.
-                let is_ready = hooks.emit_guarded_recv_peek(cfg, susp_bb, susp_stmt, resume_bb);
-                let blocked_bb = cfg.new_block();
-                cfg.emit_assign_i64(blocked_bb, state_local, state_id);
-                cfg.emit_assign_i64(blocked_bb, poll_result_local, POLL_BLOCKED);
-                cfg.set_goto(blocked_bb, exit_bb);
-                cfg.set_branch(susp_bb, is_ready, resume_bb, blocked_bb);
-            }
+            SuspKind::GuardedRecv => unreachable!("handled above"),
             SuspKind::ProducingSend => {
                 // Producing send: keep the send statement, redirect
                 // terminator to yield_bb so consumers get a turn

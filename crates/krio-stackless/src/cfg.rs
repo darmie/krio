@@ -126,6 +126,14 @@ pub trait CoroCfg {
     /// so it points to `to`. Touches every shape (goto / branch /
     /// switch / call etc.) the consumer's IR supports.
     fn redirect_targets(&mut self, bb: Self::BlockId, from: Self::BlockId, to: Self::BlockId);
+
+    /// Make `bb`, reached when a scan of a region's coroutines ran none
+    /// and some are not done, report a deadlock and not return. Returns
+    /// false if the host has no report, and the executor scans again.
+    fn emit_deadlock(&mut self, bb: Self::BlockId) -> bool {
+        let _ = bb;
+        false
+    }
 }
 
 /// Consumer-side hooks the abstract algorithm can't perform on its
