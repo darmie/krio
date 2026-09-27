@@ -146,6 +146,10 @@ unsafe extern "C" {
 //   sp+8   : pad — keeps the 16-byte granularity of the sub
 //   sp+16  : r15, r14, r13, r12, rbx, rbp   (6 × 8 = 48)
 //   sp+64  : return address pushed by the `call`
+//
+// `ldmxcsr` and `fldcw` are slow, and the incoming side's control words
+// almost always equal the outgoing side's, so each is loaded only when
+// it differs; eax and ecx, caller-saved, hold the outgoing pair.
 #[cfg(all(target_arch = "x86_64", not(windows)))]
 global_asm!(
     r#"
@@ -162,10 +166,18 @@ global_asm!(
         sub     $16, %rsp
         stmxcsr (%rsp)
         fnstcw  4(%rsp)
+        mov     (%rsp), %eax
+        movzwl  4(%rsp), %ecx
         mov    %rsp, (%rdi)
         mov    (%rsi), %rsp
+        cmp     (%rsp), %eax
+        je      1f
         ldmxcsr (%rsp)
+    1:
+        cmpw    4(%rsp), %cx
+        je      2f
         fldcw   4(%rsp)
+    2:
         add     $16, %rsp
         pop    %r15
         pop    %r14
@@ -235,10 +247,19 @@ global_asm!(
         movdqu %xmm13, 128(%rsp)
         movdqu %xmm14, 144(%rsp)
         movdqu %xmm15, 160(%rsp)
+        // Control words loaded only when they differ; see SysV above.
+        mov    0(%rsp), %r10d
+        movzwl 4(%rsp), %r11d
         mov    %rsp, (%rcx)
         mov    (%rdx), %rsp
+        cmp    0(%rsp), %r10d
+        je     1f
         ldmxcsr 0(%rsp)
+    1:
+        cmpw   4(%rsp), %r11w
+        je     2f
         fldcw   4(%rsp)
+    2:
         movdqu 16(%rsp),  %xmm6
         movdqu 32(%rsp),  %xmm7
         movdqu 48(%rsp),  %xmm8
@@ -304,9 +325,18 @@ global_asm!(
         stmxcsr (%esp)
         fnstcw  4(%esp)
         mov    %esp, (%eax)
+        // Control words loaded only when they differ; see x86_64.
+        mov    (%esp), %ecx
+        movzwl 4(%esp), %eax
         mov    (%edx), %esp
+        cmp    (%esp), %ecx
+        je     1f
         ldmxcsr (%esp)
+    1:
+        cmpw   4(%esp), %ax
+        je     2f
         fldcw   4(%esp)
+    2:
         add    $8, %esp
         pop    %edi
         pop    %esi
@@ -438,9 +468,12 @@ global_asm!(
         stp  d14, d15, [sp, #144]
         // AAPCS64 also makes FPCR (rounding mode + exception masks)
         // callee-saved; it lives at [sp, #160] and the frame pads to
-        // 192. FPSR is *not* callee-saved, so it is left alone.
-        mrs  x9, fpcr
-        str  x9, [sp, #160]
+        // 192. FPSR is *not* callee-saved, so it is left alone. `msr
+        // fpcr` is slow and the incoming FPCR almost always equals the
+        // outgoing one, held in x10, so it is written only when it
+        // differs.
+        mrs  x10, fpcr
+        str  x10, [sp, #160]
         mov  x9, sp
         str  x9, [x0]
         ldr  x9, [x1]
@@ -456,7 +489,10 @@ global_asm!(
         ldp  d12, d13, [sp, #128]
         ldp  d14, d15, [sp, #144]
         ldr  x9, [sp, #160]
+        cmp  x9, x10
+        b.eq 1f
         msr  fpcr, x9
+    1:
         add  sp, sp, #192
         ret
     "#
