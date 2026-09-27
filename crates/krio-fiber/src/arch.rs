@@ -443,6 +443,24 @@ global_asm!(
 
 // AAPCS64, non-Windows. ARM64 Windows deliberately falls through to
 // the unsupported arm below — see the module docs.
+// The return into the incoming context. `ret` predicts the address the
+// outgoing side's call pushed, which is never where the switch goes, so
+// every switch mispredicts; `br x30` goes through the indirect predictor,
+// which learns a switch's usual targets. Apple platforms do not enforce
+// BTI, which `br` to a return address would trip, so only they take it.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+macro_rules! aarch64_switch_return {
+    () => {
+        "br x30"
+    };
+}
+#[cfg(all(target_arch = "aarch64", not(windows), not(target_vendor = "apple")))]
+macro_rules! aarch64_switch_return {
+    () => {
+        "ret"
+    };
+}
+
 #[cfg(all(target_arch = "aarch64", not(windows)))]
 global_asm!(
     r#"
@@ -494,8 +512,8 @@ global_asm!(
         msr  fpcr, x9
     1:
         add  sp, sp, #192
-        ret
-    "#
+    "#,
+    aarch64_switch_return!()
 );
 
 // AAPCS64 on Windows. Same register set as the block above — the AArch64
