@@ -150,6 +150,13 @@ unsafe extern "C" {
 // `ldmxcsr` and `fldcw` are slow, and the incoming side's control words
 // almost always equal the outgoing side's, so each is loaded only when
 // it differs; eax and ecx, caller-saved, hold the outgoing pair.
+//
+// The switch returns into the incoming context by `pop` and `jmp`: a
+// `ret` is predicted to go where the outgoing side's call came from,
+// which it never does, while an indirect jump learns the switch's usual
+// targets. A CET shadow stack would object to the unmatched call, as it
+// already does to a `ret` into another stack; this object carries no
+// shadow-stack marking, so no binary linking it runs with one.
 #[cfg(all(target_arch = "x86_64", not(windows)))]
 global_asm!(
     r#"
@@ -185,7 +192,8 @@ global_asm!(
         pop    %r12
         pop    %rbx
         pop    %rbp
-        ret
+        pop    %rcx
+        jmp    *%rcx
     "#,
     options(att_syntax)
 );
