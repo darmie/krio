@@ -42,6 +42,9 @@ impl Stack {
     pub fn new(requested_size: usize) -> Self {
         #[cfg(unix)]
         {
+            if let Some(stack) = cache::take(usable_size(requested_size)) {
+                return stack;
+            }
             unsafe { mmap_stack(requested_size) }
         }
         #[cfg(not(unix))]
@@ -71,17 +74,33 @@ impl Stack {
 }
 
 #[cfg(unix)]
+fn page_size() -> usize {
+    static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE.get_or_init(|| {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        assert!(page_size > 0, "sysconf(_SC_PAGESIZE) must be positive");
+        page_size
+    })
+}
+
+/// The usable bytes a stack of `requested_size` gets: a whole number
+/// of pages.
+#[cfg(unix)]
+fn usable_size(requested_size: usize) -> usize {
+    requested_size.div_ceil(page_size()) * page_size()
+}
+
+#[cfg(unix)]
 unsafe fn mmap_stack(requested_size: usize) -> Stack {
     use libc::{
         MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_NONE, PROT_READ, PROT_WRITE, mmap, mprotect,
     };
 
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-    assert!(page_size > 0, "sysconf(_SC_PAGESIZE) must be positive");
+    let page_size = page_size();
 
     // Round usable size up to a page; add one extra page below for
     // the guard.
-    let usable_size = requested_size.div_ceil(page_size) * page_size;
+    let usable_size = usable_size(requested_size);
     let total = usable_size + page_size;
 
     // mmap an anonymous region. PROT_READ|PROT_WRITE for the whole
@@ -137,12 +156,145 @@ impl Drop for Stack {
     fn drop(&mut self) {
         #[cfg(unix)]
         unsafe {
+            if cache::park(self) {
+                return;
+            }
             // munmap the whole region, including the guard page.
             // Errors are ignored — there's nothing useful we can do
             // on drop, and the address came from mmap so it's valid.
             libc::munmap(self.base, self.total_bytes);
         }
         // On non-unix the Box<[u8]> drop handles itself.
+    }
+}
+
+/// Stacks a thread keeps for the next fiber of the same size, so a
+/// fiber that finishes and the next one to start cost no `mmap`,
+/// `mprotect` or `munmap`. A kept stack still holds the pages its
+/// last fiber touched, and its contents are stale: a fiber writes
+/// before it reads, and a collector scans only from a suspended
+/// fiber's saved stack pointer.
+#[cfg(unix)]
+mod cache {
+    use super::Stack;
+    use std::cell::RefCell;
+
+    /// Stacks one thread keeps.
+    const MAX_PARKED: usize = 16;
+
+    struct Parked {
+        base: *mut libc::c_void,
+        total_bytes: usize,
+        usable_start: *mut u8,
+        usable_len: usize,
+    }
+
+    struct Pool(Vec<Parked>);
+
+    impl Drop for Pool {
+        fn drop(&mut self) {
+            for p in self.0.drain(..) {
+                // SAFETY: `base` and `total_bytes` came from `mmap`, and
+                // nothing else owns the mapping.
+                unsafe { libc::munmap(p.base, p.total_bytes) };
+            }
+        }
+    }
+
+    thread_local! {
+        static POOL: RefCell<Pool> = const { RefCell::new(Pool(Vec::new())) };
+    }
+
+    /// A kept stack with exactly `usable_len` usable bytes, the most
+    /// recently kept first.
+    pub(super) fn take(usable_len: usize) -> Option<Stack> {
+        POOL.try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            let i = pool.0.iter().rposition(|p| p.usable_len == usable_len)?;
+            let p = pool.0.swap_remove(i);
+            Some(Stack {
+                base: p.base,
+                total_bytes: p.total_bytes,
+                usable_start: p.usable_start,
+                usable_len: p.usable_len,
+            })
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// Keep `stack`'s mapping for a later fiber; false when this thread
+    /// already keeps its share, or is gone.
+    pub(super) fn park(stack: &Stack) -> bool {
+        POOL.try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.0.len() >= MAX_PARKED {
+                return false;
+            }
+            pool.0.push(Parked {
+                base: stack.base,
+                total_bytes: stack.total_bytes,
+                usable_start: stack.usable_start,
+                usable_len: stack.usable_len,
+            });
+            true
+        })
+        .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    pub(super) fn parked() -> usize {
+        POOL.with(|pool| pool.borrow().0.len())
+    }
+
+    #[cfg(test)]
+    pub(super) const LIMIT: usize = MAX_PARKED;
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dropped_stack_is_reused_for_the_next_of_its_size() {
+        let first = Stack::new(64 << 10);
+        let start = first.usable_start() as usize;
+        drop(first);
+        let second = Stack::new(64 << 10);
+        assert_eq!(second.usable_start() as usize, start);
+    }
+
+    #[test]
+    fn a_stack_of_another_size_is_not_reused() {
+        let small = Stack::new(64 << 10);
+        let start = small.usable_start() as usize;
+        drop(small);
+        let large = Stack::new(128 << 10);
+        assert_ne!(large.usable_start() as usize, start);
+        assert_eq!(large.usable_len(), 128 << 10);
+        assert_eq!(cache::parked(), 1);
+    }
+
+    #[test]
+    fn a_thread_keeps_a_bounded_number_of_stacks() {
+        let stacks: Vec<Stack> = (0..cache::LIMIT + 8)
+            .map(|_| Stack::new(64 << 10))
+            .collect();
+        drop(stacks);
+        assert_eq!(cache::parked(), cache::LIMIT);
+    }
+
+    #[test]
+    fn a_reused_stack_is_usable_to_its_top() {
+        let mut first = Stack::new(64 << 10);
+        first.usable_slice_mut().fill(0xAB);
+        drop(first);
+        let mut second = Stack::new(64 << 10);
+        let len = second.usable_len();
+        let slice = second.usable_slice_mut();
+        slice[0] = 1;
+        slice[len - 1] = 2;
+        assert_eq!((slice[0], slice[len - 1]), (1, 2));
     }
 }
 
